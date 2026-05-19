@@ -1,4 +1,5 @@
 using UniGetUI.Core.Data;
+using UniGetUI.Core.SettingsEngine;
 using UniGetUI.PackageEngine.Enums;
 
 namespace UniGetUI.Core.Language.Tests
@@ -15,6 +16,25 @@ namespace UniGetUI.Core.Language.Tests
 
             engine.LoadLanguage(language);
             Assert.Equal(translation, engine.Translate("Android Subsystem"));
+        }
+
+        [Fact]
+        public void DefaultLocaleIsSimplifiedChinese()
+        {
+            string previousLanguage = Settings.GetValue(Settings.K.PreferredLanguage);
+            Settings.SetValue(Settings.K.PreferredLanguage, "");
+
+            try
+            {
+                LanguageEngine engine = new();
+
+                Assert.Equal(LanguageEngine.DefaultLocale, engine.Locale);
+                Assert.Equal("安卓子系统", engine.Translate("Android Subsystem"));
+            }
+            finally
+            {
+                Settings.SetValue(Settings.K.PreferredLanguage, previousLanguage);
+            }
         }
 
         [Fact]

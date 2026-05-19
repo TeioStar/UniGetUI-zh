@@ -1,5 +1,4 @@
 using System.Diagnostics.CodeAnalysis;
-using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using Jeffijoe.MessageFormat;
@@ -11,6 +10,8 @@ namespace UniGetUI.Core.Language
 {
     public class LanguageEngine
     {
+        public const string DefaultLocale = "zh_CN";
+
         private static readonly Dictionary<string, string> LocaleAliases = new(StringComparer.OrdinalIgnoreCase)
         {
             { "es_MX", "es-MX" },
@@ -31,7 +32,7 @@ namespace UniGetUI.Core.Language
             string LangName = Settings.GetValue(Settings.K.PreferredLanguage);
             if (LangName is "default" or "")
             {
-                LangName = CultureInfo.CurrentUICulture.ToString().Replace("-", "_");
+                LangName = DefaultLocale;
                 if (string.IsNullOrWhiteSpace(LangName))
                 {
                     LangName = "en";

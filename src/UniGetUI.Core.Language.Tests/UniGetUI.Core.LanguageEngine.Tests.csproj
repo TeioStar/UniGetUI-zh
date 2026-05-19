@@ -25,6 +25,7 @@
 
     <ItemGroup>
         <ProjectReference Include="..\UniGetUI.Core.LanguageEngine\UniGetUI.Core.LanguageEngine.csproj" />
+        <ProjectReference Include="..\UniGetUI.Core.Settings\UniGetUI.Core.Settings.csproj" />
     </ItemGroup>
 
     <ItemGroup>
