@@ -44,19 +44,22 @@ internal sealed class CargoPkgDetailsHelper(Cargo manager) : BasePkgDetailsHelpe
         var categories = manifest.categories?.Select(c => c.category) ?? [];
         details.Tags = [.. keywords, .. categories];
 
-        var versionData = manifest
-            .versions.Where((v) => v.num == details.Package.VersionString)
-            .First();
-
-        details.Author = versionData.published_by?.name;
-        details.License = versionData.license;
-        details.InstallerUrl = new Uri(
-            (CratesIOClient.ApiUrl + versionData.dl_path).Replace("/api/v1/api/v1", "/api/v1")
+        var versionData = manifest.versions.FirstOrDefault(v =>
+            v.num == details.Package.VersionString
         );
-        details.InstallerSize = versionData.crate_size ?? 0;
-        details.InstallerHash = versionData.checksum;
-        details.Publisher = versionData.published_by?.name;
-        details.UpdateDate = versionData.updated_at;
+
+        if (versionData is not null)
+        {
+            details.Author = versionData.published_by?.name;
+            details.License = versionData.license;
+            details.InstallerUrl = new Uri(
+                (CratesIOClient.ApiUrl + versionData.dl_path).Replace("/api/v1/api/v1", "/api/v1")
+            );
+            details.InstallerSize = versionData.crate_size ?? 0;
+            details.InstallerHash = versionData.checksum;
+            details.Publisher = versionData.published_by?.name;
+            details.UpdateDate = versionData.updated_at;
+        }
 
         // TODO: most packages are hosted on Github; see if there's a way to use the repository
         // info to extract release notes
@@ -77,11 +80,14 @@ internal sealed class CargoPkgDetailsHelper(Cargo manager) : BasePkgDetailsHelpe
 
     protected override string? GetInstallLocation_UnSafe(IPackage package)
     {
-        return Path.Join(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".cargo",
-            "bin"
-        );
+        // Cargo installs binaries into $CARGO_HOME/bin (default ~/.cargo/bin).
+        var cargoHome = Environment.GetEnvironmentVariable("CARGO_HOME");
+        if (string.IsNullOrEmpty(cargoHome))
+            cargoHome = Path.Join(
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                ".cargo"
+            );
+        return Path.Join(cargoHome, "bin");
     }
 
     protected override IReadOnlyList<string> GetInstallableVersions_UnSafe(IPackage package)

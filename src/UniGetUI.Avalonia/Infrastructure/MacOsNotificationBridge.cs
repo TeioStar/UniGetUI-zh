@@ -1,22 +1,28 @@
-using System.Diagnostics;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using Avalonia.Threading;
+using UniGetUI.Avalonia.Views;
 using UniGetUI.Core.Data;
 using UniGetUI.Core.Logging;
 using UniGetUI.Core.SettingsEngine;
 using UniGetUI.Core.Tools;
+using UniGetUI.Interface.Enums;
 using UniGetUI.PackageEngine.Interfaces;
 using UniGetUI.PackageOperations;
 
 namespace UniGetUI.Avalonia.Infrastructure;
 
 /// <summary>
-/// macOS system notification delivery via osascript (works on all macOS versions).
-/// NSUserNotificationCenter was removed in macOS 14; UNUserNotificationCenter requires
-/// ObjC blocks that are impractical via pure P/Invoke. osascript is always available.
-/// Callers are responsible for the OperatingSystem.IsMacOS() guard before invoking.
+/// macOS system notification delivery through the app-bundled UserNotifications bridge.
+/// The bridge owns the Objective-C delegate and completion blocks so this NativeAOT assembly
+/// can use a fixed P/Invoke boundary and receive default notification activations.
 /// </summary>
-internal static class MacOsNotificationBridge
+internal static partial class MacOsNotificationBridge
 {
+    private const string NativeBridgePath = "@executable_path/UniGetUIMacNotificationBridge.dylib";
+    private static readonly Lock InitializationLock = new();
+    private static bool _isInitialized;
+
     // ── Operation notifications ────────────────────────────────────────────
 
     public static bool ShowProgress(AbstractOperation operation)
@@ -30,7 +36,7 @@ internal static class MacOsNotificationBridge
             string message = operation.Metadata.Status.Length > 0
                 ? operation.Metadata.Status
                 : CoreTools.Translate("Please wait...");
-            DeliverNotification(title, message);
+            DeliverNotification(title, message, MainWindow.RuntimeNotificationLevel.Progress, allowInAppFallback: false);
             return true;
         }
         catch (Exception ex)
@@ -52,7 +58,7 @@ internal static class MacOsNotificationBridge
             string message = operation.Metadata.SuccessMessage.Length > 0
                 ? operation.Metadata.SuccessMessage
                 : CoreTools.Translate("Success!");
-            DeliverNotification(title, message);
+            DeliverNotification(title, message, MainWindow.RuntimeNotificationLevel.Success, allowInAppFallback: false);
             return true;
         }
         catch (Exception ex)
@@ -74,7 +80,7 @@ internal static class MacOsNotificationBridge
             string message = operation.Metadata.FailureMessage.Length > 0
                 ? operation.Metadata.FailureMessage
                 : CoreTools.Translate("An error occurred while processing this package");
-            DeliverNotification(title, message);
+            DeliverNotification(title, message, MainWindow.RuntimeNotificationLevel.Error, allowInAppFallback: false);
             return true;
         }
         catch (Exception ex)
@@ -104,7 +110,8 @@ internal static class MacOsNotificationBridge
                 title = CoreTools.Translate("Updates found!");
                 message = CoreTools.Translate("{0} packages can be updated", upgradable.Count);
             }
-            DeliverNotification(title, message);
+            DeliverNotification(title, message, MainWindow.RuntimeNotificationLevel.Success,
+                inAppLaunchAction: NotificationArguments.ShowOnUpdatesTab);
         }
         catch (Exception ex)
         {
@@ -130,7 +137,7 @@ internal static class MacOsNotificationBridge
                 title = CoreTools.Translate("{0} packages are being updated", upgradable.Count);
                 message = string.Join(", ", upgradable.Select(p => p.Name));
             }
-            DeliverNotification(title, message);
+            DeliverNotification(title, message, MainWindow.RuntimeNotificationLevel.Progress);
         }
         catch (Exception ex)
         {
@@ -145,7 +152,8 @@ internal static class MacOsNotificationBridge
         {
             DeliverNotification(
                 CoreTools.Translate("{0} can be updated to version {1}", "UniGetUI", newVersion),
-                CoreTools.Translate("You have currently version {0} installed", CoreData.VersionName));
+                CoreTools.Translate("You have currently version {0} installed", CoreData.VersionName),
+                MainWindow.RuntimeNotificationLevel.Success);
         }
         catch (Exception ex)
         {
@@ -174,7 +182,7 @@ internal static class MacOsNotificationBridge
                     "UniGetUI has detected {0} new desktop shortcuts that can be deleted automatically.",
                     shortcuts.Count);
             }
-            DeliverNotification(title, message);
+            DeliverNotification(title, message, MainWindow.RuntimeNotificationLevel.Success);
         }
         catch (Exception ex)
         {
@@ -185,72 +193,64 @@ internal static class MacOsNotificationBridge
 
     // ── Core delivery ──────────────────────────────────────────────────────
 
-    private static void DeliverNotification(string title, string message)
+    private static void DeliverNotification(
+        string title,
+        string message,
+        MainWindow.RuntimeNotificationLevel level,
+        bool allowInAppFallback = true,
+        string? inAppLaunchAction = null)
     {
-        // NSUserNotificationCenter was removed in macOS 14; osascript works on all versions.
-        string script = "display notification " + AppleScriptString(message)
-                        + " with title " + AppleScriptString(title);
-        Process.Start(new ProcessStartInfo
+        if (MainWindow.IsWindowOnScreen)
         {
-            FileName = "/usr/bin/osascript",
-            ArgumentList = { "-e", script },
-            UseShellExecute = false,
-            CreateNoWindow = true,
-        });
+            if (allowInAppFallback)
+                Dispatcher.UIThread.Post(() =>
+                    MainWindow.Instance?.ShowRuntimeNotification(title, message, level, inAppLaunchAction));
+            return;
+        }
+
+        if (!EnsureInitialized())
+            throw new InvalidOperationException("The macOS notification bridge is unavailable.");
+
+        if (ShowNativeNotification(title, message) == 0)
+        {
+            throw new InvalidOperationException("The macOS notification bridge rejected the notification.");
+        }
     }
 
-    private static string AppleScriptString(string s) =>
-        "\"" + s.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
-
-    // ── Dock icon ──────────────────────────────────────────────────────────
-
-    public static void SetDockIcon(byte[] pngBytes)
+    private static unsafe bool EnsureInitialized()
     {
-        try
+        if (_isInitialized)
+            return true;
+
+        lock (InitializationLock)
         {
-            var handle = GCHandle.Alloc(pngBytes, GCHandleType.Pinned);
+            if (_isInitialized)
+                return true;
+
             try
             {
-                IntPtr nsData = MsgSendBytes(
-                    objc_getClass("NSData"), Sel("dataWithBytes:length:"),
-                    handle.AddrOfPinnedObject(), pngBytes.Length);
-
-                IntPtr nsImage = MsgSend(
-                    MsgSend(objc_getClass("NSImage"), Sel("alloc")),
-                    Sel("initWithData:"), nsData);
-
-                IntPtr nsApp = MsgSend(objc_getClass("NSApplication"), Sel("sharedApplication"));
-                MsgSend(nsApp, Sel("setApplicationIconImage:"), nsImage);
-                MsgSend(nsImage, Sel("autorelease"));
+                _isInitialized = InitializeNativeNotifications(
+                    (nint)(delegate* unmanaged[Cdecl]<void>)&OnNotificationActivated) != 0;
+                return _isInitialized;
             }
-            finally
+            catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException)
             {
-                handle.Free();
+                Logger.Warn("The macOS notification bridge is unavailable.");
+                Logger.Warn(ex);
+                return false;
             }
-        }
-        catch (Exception ex)
-        {
-            Logger.Warn("Failed to set macOS dock icon");
-            Logger.Warn(ex);
         }
     }
 
-    private static IntPtr Sel(string name) => sel_registerName(name);
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static void OnNotificationActivated()
+    {
+        Dispatcher.UIThread.Post(() => MainWindow.Instance?.ShowFromTray());
+    }
 
-    // ── ObjC runtime P/Invoke (used by SetDockIcon) ────────────────────────
+    [LibraryImport(NativeBridgePath, EntryPoint = "UniGetUIInitializeMacNotifications")]
+    private static partial int InitializeNativeNotifications(nint activationCallback);
 
-    [DllImport("/usr/lib/libobjc.A.dylib")]
-    private static extern IntPtr objc_getClass(string name);
-
-    [DllImport("/usr/lib/libobjc.A.dylib")]
-    private static extern IntPtr sel_registerName(string name);
-
-    [DllImport("/usr/lib/libobjc.A.dylib", EntryPoint = "objc_msgSend")]
-    private static extern IntPtr MsgSend(IntPtr receiver, IntPtr sel);
-
-    [DllImport("/usr/lib/libobjc.A.dylib", EntryPoint = "objc_msgSend")]
-    private static extern IntPtr MsgSend(IntPtr receiver, IntPtr sel, IntPtr arg);
-
-    [DllImport("/usr/lib/libobjc.A.dylib", EntryPoint = "objc_msgSend")]
-    private static extern IntPtr MsgSendBytes(IntPtr receiver, IntPtr sel, IntPtr bytes, nint length);
+    [LibraryImport(NativeBridgePath, EntryPoint = "UniGetUIShowMacNotification", StringMarshalling = StringMarshalling.Utf8)]
+    private static partial int ShowNativeNotification(string title, string message);
 }

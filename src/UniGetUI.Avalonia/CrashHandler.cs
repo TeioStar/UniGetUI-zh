@@ -3,6 +3,7 @@ using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
 using System.Text;
 using UniGetUI.Core.Data;
+using UniGetUI.Core.Logging;
 using UniGetUI.Core.Tools;
 
 namespace UniGetUI.Avalonia;
@@ -10,7 +11,7 @@ namespace UniGetUI.Avalonia;
 public static class CrashHandler
 {
     public static readonly string PendingCrashFile =
-        Path.Combine(Path.GetTempPath(), "UniGetUI_pending_crash.txt");
+        Path.Combine(AppPaths.ScratchDirectory, "pending_crash.txt");
 
     private const string NO_CORRUPT_DIALOG = "--no-corrupt-dialog";
 
@@ -93,7 +94,7 @@ public static class CrashHandler
     {
         Debugger.Break();
 
-        if (OperatingSystem.IsWindows() && !Environment.GetCommandLineArgs().Contains(NO_CORRUPT_DIALOG))
+        if (OperatingSystem.IsWindows() && !CoreData.GetProcessArguments().Contains(NO_CORRUPT_DIALOG))
         {
             Exception? fileEx = e;
             while (fileEx is not null)
@@ -215,11 +216,14 @@ public static class CrashHandler
             // ignore
         }
 
+        Error_String = Logger.Redact(Error_String);
+
         Console.WriteLine(Error_String);
 
         // Persist crash data so the next normal app launch can show the report.
         try
         {
+            Directory.CreateDirectory(Path.GetDirectoryName(PendingCrashFile)!);
             File.WriteAllText(PendingCrashFile, Error_String, Encoding.UTF8);
         }
         catch

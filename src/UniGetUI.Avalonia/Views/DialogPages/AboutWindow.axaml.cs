@@ -3,7 +3,7 @@ using Avalonia.Threading;
 
 namespace UniGetUI.Avalonia.Views.DialogPages;
 
-public partial class AboutWindow : Window
+public partial class AboutWindow : UniGetUI.Avalonia.Views.DialogPages.ImmersiveDialog
 {
     public AboutWindow()
     {

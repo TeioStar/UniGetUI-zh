@@ -1,3 +1,4 @@
+using UniGetUI.Core.Tools;
 using UniGetUI.PackageEngine.Classes.Manager.BaseProviders;
 using UniGetUI.PackageEngine.Enums;
 using UniGetUI.PackageEngine.Interfaces;
@@ -39,6 +40,11 @@ internal sealed class PowerShell7PkgOperationHelper : BasePkgOperationHelper
         }
         else if (operation is OperationType.Uninstall)
         {
+            if (!CoreTools.IsValidPackageVersion(package.VersionString))
+                throw new InvalidOperationException(
+                    $"Refusing to build a {Manager.Name} command line for package {package.Id}: the installed version \"{package.VersionString}\" is not a valid package version."
+                );
+
             parameters.AddRange(["-Version", package.VersionString]);
         }
 
@@ -49,16 +55,11 @@ internal sealed class PowerShell7PkgOperationHelper : BasePkgOperationHelper
             if (options.PreRelease)
                 parameters.Add("-Prerelease");
 
-            if (
-                package.OverridenOptions.Scope is PackageScope.Global
-                || (
-                    package.OverridenOptions.Scope is null
-                    && options.InstallationScope is PackageScope.Global
-                )
-            )
-                parameters.AddRange(["-Scope", "AllUsers"]);
-            else
-                parameters.AddRange(["-Scope", "CurrentUser"]);
+            // The scope chosen in the options dialog wins; fall back to the auto-detected install scope
+            string scope = options.InstallationScope.Length > 0
+                ? options.InstallationScope
+                : package.OverridenOptions.Scope ?? "";
+            parameters.AddRange(["-Scope", scope == PackageScope.Global ? "AllUsers" : "CurrentUser"]);
         }
 
         parameters.AddRange(

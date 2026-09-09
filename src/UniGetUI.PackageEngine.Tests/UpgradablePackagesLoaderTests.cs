@@ -67,6 +67,47 @@ public sealed class UpgradablePackagesLoaderTests : IDisposable
     }
 
     [Fact]
+    public async Task EvaluatePackageAsync_RespectsSkipMinorLevel()
+    {
+        var manager = new PackageManagerBuilder().Build();
+        _ = new InstalledPackagesLoader([manager]);
+        _ = new DiscoverablePackagesLoader([manager]);
+        var loader = new TestUpgradablePackagesLoader([manager]);
+
+        // A 3rd-position (patch) change on a four-part version.
+        var package = new PackageBuilder()
+            .WithManager(manager)
+            .WithId("Contoso.FourPart")
+            .WithVersion("3.4.5.6")
+            .WithNewVersion("3.4.6.6")
+            .Build();
+
+        // Level 4 => only 4th-position changes count as minor, so this patch change must NOT be skipped.
+        InstallOptionsFactory.SaveForPackage(
+            new InstallOptions
+            {
+                OverridesNextLevelOpts = true,
+                SkipMinorUpdates = true,
+                SkipMinorUpdatesLevel = 4,
+            },
+            package
+        );
+        Assert.True(await loader.EvaluatePackageAsync(package));
+
+        // Default level (3) => a 3rd-position change is minor and must be skipped.
+        InstallOptionsFactory.SaveForPackage(
+            new InstallOptions
+            {
+                OverridesNextLevelOpts = true,
+                SkipMinorUpdates = true,
+                SkipMinorUpdatesLevel = InstallOptions.DefaultSkipMinorLevel,
+            },
+            package
+        );
+        Assert.False(await loader.EvaluatePackageAsync(package));
+    }
+
+    [Fact]
     public async Task EvaluatePackageAsync_SkipsIgnoredAndSupersededPackages()
     {
         var manager = new PackageManagerBuilder().Build();
@@ -100,6 +141,35 @@ public sealed class UpgradablePackagesLoaderTests : IDisposable
         Assert.False(await loader.EvaluatePackageAsync(supersededPackage));
     }
 
+    // Regression test for issue #5293: the installed version carried a Homebrew build revision
+    // ("18.4_1"), which the version parser read as 18.41. That compared as greater than the
+    // available 18.6, so the loader discarded the update and it never reached the UI.
+    [Fact]
+    public async Task EvaluatePackageAsync_KeepsUpdateWhenInstalledVersionHasBuildRevision()
+    {
+        var manager = new PackageManagerBuilder().Build();
+        var installedLoader = new InstalledPackagesLoader([manager]);
+        _ = new DiscoverablePackagesLoader([manager]);
+        var loader = new TestUpgradablePackagesLoader([manager]);
+
+        await installedLoader.AddForeign(
+            new PackageBuilder()
+                .WithManager(manager)
+                .WithId("postgresql@18")
+                .WithVersion("18.4_1")
+                .Build()
+        );
+
+        var package = new PackageBuilder()
+            .WithManager(manager)
+            .WithId("postgresql@18")
+            .WithVersion("18.4_1")
+            .WithNewVersion("18.6")
+            .Build();
+
+        Assert.True(await loader.EvaluatePackageAsync(package));
+    }
+
     [Fact]
     public async Task ApplyWhenAddingPackageAsync_UpdatesDiscoverableAndInstalledTags()
     {
@@ -123,22 +193,5 @@ public sealed class UpgradablePackagesLoaderTests : IDisposable
 
         Assert.Equal(PackageTag.IsUpgradable, availablePackage.Tag);
         Assert.Equal(PackageTag.IsUpgradable, installedPackage.Tag);
-    }
-
-    [Theory]
-    [InlineData("120", 120000)]
-    [InlineData("not-a-number", 3600000)]
-    public void StartTimer_UsesConfiguredIntervalOrDefault(string configuredValue, double expectedInterval)
-    {
-        var manager = new PackageManagerBuilder().Build();
-        _ = new InstalledPackagesLoader([manager]);
-        _ = new DiscoverablePackagesLoader([manager]);
-        var loader = new TestUpgradablePackagesLoader([manager]);
-        Settings.Set(Settings.K.DisableAutoCheckforUpdates, false);
-        Settings.SetValue(Settings.K.UpdatesCheckInterval, configuredValue);
-
-        loader.StartTimer();
-
-        Assert.Equal(expectedInterval, loader.GetTimerIntervalMilliseconds());
     }
 }

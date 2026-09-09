@@ -3,13 +3,12 @@ using Avalonia.Threading;
 
 namespace UniGetUI.Avalonia.Views.DialogPages;
 
-public partial class SimpleErrorDialog : Window
+public partial class SimpleErrorDialog : UniGetUI.Avalonia.Views.DialogPages.ImmersiveDialog
 {
     public SimpleErrorDialog(string title, string message)
     {
         InitializeComponent();
         Title = title;
-        TitleBlock.Text = title;
         MessageBlock.Text = message;
         OkButton.Click += (_, _) => Close();
     }

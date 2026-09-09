@@ -1,10 +1,55 @@
 using System.Runtime.InteropServices;
 using Microsoft.Win32;
+using UniGetUI.Shared;
 
 namespace UniGetUI.Tests;
 
 public sealed class AutoUpdaterTests
 {
+    [Fact]
+    public void InstallerArguments_LeaveARegularInstallToTheInstallersOwnDirectoryLogic()
+    {
+        string arguments = AutoUpdaterInstallerArguments.ForWindows(false, @"C:\Program Files\UniGetUI");
+
+        Assert.DoesNotContain("/DIR=", arguments);
+        Assert.DoesNotContain("/TASKS=", arguments);
+        Assert.Contains("/SILENT", arguments);
+    }
+
+    [Fact]
+    public void InstallerArguments_PinAPortableInstallToItsOwnDirectory()
+    {
+        string arguments = AutoUpdaterInstallerArguments.ForWindows(true, @"E:\Portable Apps\UniGetUI");
+
+        Assert.Contains(@"/DIR=""E:\Portable Apps\UniGetUI""", arguments);
+        Assert.Contains(@"/TASKS=""portableinstall""", arguments);
+        Assert.Contains("/SILENT", arguments);
+    }
+
+    [Fact]
+    public void InstallerArguments_DoNotLeaveATrailingSeparatorBeforeTheClosingQuote()
+    {
+        string arguments = AutoUpdaterInstallerArguments.ForWindows(true, @"E:\UniGetUI\");
+
+        Assert.Contains(@"/DIR=""E:\UniGetUI""", arguments);
+        Assert.DoesNotContain(@"\""", arguments);
+    }
+
+    [Fact]
+    public void InstallerArguments_KeepTheSeparatorForAVolumeRoot()
+    {
+        string arguments = AutoUpdaterInstallerArguments.ForWindows(true, @"E:\");
+
+        Assert.Contains(@"/DIR=""E:\""", arguments);
+        Assert.DoesNotContain(@"/DIR=""E:""", arguments);
+    }
+
+    [Fact]
+    public void InstallerArguments_FallBackToDefaultsWhenTheDirectoryIsUnknown()
+    {
+        Assert.DoesNotContain("/DIR=", AutoUpdaterInstallerArguments.ForWindows(true, ""));
+    }
+
     [Theory]
     [InlineData("https://devolutions.net/productinfo.json", false, true)]
     [InlineData("https://updates.devolutions.net/productinfo.json", false, true)]
@@ -18,7 +63,7 @@ public sealed class AutoUpdaterTests
         bool expected
     )
     {
-        Assert.Equal(expected, AutoUpdater.IsSourceUrlAllowed(url, allowUnsafeUrls));
+        Assert.Equal(expected, AutoUpdaterHelpers.IsSourceUrlAllowed(url, allowUnsafeUrls));
     }
 
     [Fact]
@@ -30,7 +75,7 @@ public sealed class AutoUpdaterTests
             Architecture.X64 => "x64",
             _ => "x64",
         };
-        var preferred = new AutoUpdater.ProductInfoFile
+        var preferred = new AutoUpdaterHelpers.ProductInfoFile
         {
             Arch = targetArch,
             Type = "exe",
@@ -38,16 +83,16 @@ public sealed class AutoUpdaterTests
             Hash = "hash-exe",
         };
 
-        var selected = AutoUpdater.SelectInstallerFile(
+        var selected = AutoUpdaterHelpers.SelectInstallerFile(
             [
-                new AutoUpdater.ProductInfoFile
+                new AutoUpdaterHelpers.ProductInfoFile
                 {
                     Arch = "Any",
                     Type = "exe",
                     Url = "https://example.test/any.exe",
                     Hash = "hash-any",
                 },
-                new AutoUpdater.ProductInfoFile
+                new AutoUpdaterHelpers.ProductInfoFile
                 {
                     Arch = targetArch,
                     Type = "msi",
@@ -66,14 +111,14 @@ public sealed class AutoUpdaterTests
     {
         Version fallback = new(9, 9, 9, 9);
 
-        Assert.Equal(new Version(1, 2, 3), AutoUpdater.ParseVersionOrFallback("v1.2.3", fallback));
-        Assert.Equal(fallback, AutoUpdater.ParseVersionOrFallback("not-a-version", fallback));
+        Assert.Equal(new Version(1, 2, 3), AutoUpdaterHelpers.ParseVersionOrFallback("v1.2.3", fallback));
+        Assert.Equal(fallback, AutoUpdaterHelpers.ParseVersionOrFallback("not-a-version", fallback));
     }
 
     [Fact]
     public void NormalizeThumbprint_RemovesNonHexCharactersAndLowercases()
     {
-        Assert.Equal("abcdef1234", AutoUpdater.NormalizeThumbprint("AB:CD ef-12_34"));
+        Assert.Equal("abcdef1234", AutoUpdaterHelpers.NormalizeThumbprint("AB:CD ef-12_34"));
     }
 
 #if DEBUG
@@ -87,10 +132,10 @@ public sealed class AutoUpdaterTests
 
         try
         {
-            Assert.Equal("https://devolutions.net/custom.json", AutoUpdater.GetRegistryString(key, "ProductInfoUrl"));
-            Assert.True(AutoUpdater.GetRegistryBool(key, "AllowUnsafe"));
-            Assert.Null(AutoUpdater.GetRegistryString(key, "Missing"));
-            Assert.False(AutoUpdater.GetRegistryBool(key, "Missing"));
+            Assert.Equal("https://devolutions.net/custom.json", AutoUpdaterHelpers.GetRegistryString(key, "ProductInfoUrl"));
+            Assert.True(AutoUpdaterHelpers.GetRegistryBool(key, "AllowUnsafe"));
+            Assert.Null(AutoUpdaterHelpers.GetRegistryString(key, "Missing"));
+            Assert.False(AutoUpdaterHelpers.GetRegistryBool(key, "Missing"));
         }
         finally
         {

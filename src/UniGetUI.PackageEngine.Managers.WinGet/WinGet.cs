@@ -20,6 +20,10 @@ namespace UniGetUI.PackageEngine.Managers.WingetManager
 {
     public class WinGet : PackageManager
     {
+        // Add/Remove-programs identifiers legitimately contain spaces, for example
+        // "ARP\Machine\X86\Microsoft Copilot"; GetIdNamePiece quotes them.
+        public override bool IdentifiersAreQuotedOnCommandLine => true;
+
         internal const string CliToolPreferenceEnvironmentVariable = "UNIGETUI_WINGET_CLI";
         internal const string ComApiPolicyEnvironmentVariable = "UNIGETUI_WINGET_COM";
         private const string SystemWinGetExecutableName = "winget.exe";
@@ -58,6 +62,42 @@ namespace UniGetUI.PackageEngine.Managers.WingetManager
         public static bool NO_PACKAGES_HAVE_BEEN_LOADED { get; private set; }
         internal WinGetCliToolKind SelectedCliToolKind { get; private set; } =
             WinGetCliToolKind.SystemWinGet;
+
+        // winget's local index isn't safe under concurrent process access: a `source update` (writer)
+        // running alongside list/upgrade/search (readers) yields partial or empty results. The COM
+        // backend serialized this implicitly; the CLI backends (winget.exe / pinget.exe) must do it
+        // explicitly. Reentrant (Monitor) so same-thread nested invocations don't self-deadlock.
+        private static readonly object _cliInvocationLock = new();
+
+        // Safety valve: never wait on the CLI lock longer than this, so a hung process can't freeze all WinGet queries.
+        private static readonly TimeSpan CliLockTimeout = TimeSpan.FromSeconds(120);
+
+        internal static IDisposable AcquireCliLock()
+        {
+            bool taken = false;
+            Monitor.TryEnter(_cliInvocationLock, CliLockTimeout, ref taken);
+            if (!taken)
+                Logger.Warn("WinGet CLI lock not acquired within timeout; proceeding unserialized to avoid a hang.");
+            return new CliLockReleaser(taken);
+        }
+
+        private sealed class CliLockReleaser(bool taken) : IDisposable
+        {
+            private bool _released;
+            public void Dispose()
+            {
+                if (_released || !taken) return;
+                _released = true;
+                Monitor.Exit(_cliInvocationLock);
+            }
+        }
+
+        private static long _sourceIndexGeneration;
+
+        internal static long SourceIndexGeneration => Volatile.Read(ref _sourceIndexGeneration);
+
+        internal static void MarkSourceIndexRefreshed() =>
+            Interlocked.Increment(ref _sourceIndexGeneration);
 
         public WinGet()
         {
@@ -196,6 +236,23 @@ namespace UniGetUI.PackageEngine.Managers.WingetManager
             return PingetPackageDetailsProvider.TryGetInstallerHostsForVersion(package, version);
         }
 
+        public static IReadOnlyList<string>? TryGetInstallerUrls(
+            UniGetUI.PackageEngine.Interfaces.IPackage package,
+            string? version
+        )
+        {
+            return PingetPackageDetailsProvider.TryGetInstallerUrls(package, version);
+        }
+
+        public bool ReportedUpdateNotApplicable(
+            IReadOnlyList<string> processOutput,
+            int returnCode
+        )
+        {
+            return OperationHelper is WinGetPkgOperationHelper helper
+                && helper.ReportedUpdateNotApplicable(processOutput, returnCode);
+        }
+
         protected override IReadOnlyList<Package> FindPackages_UnSafe(string query)
         {
             return WinGetHelper.Instance.FindPackages_UnSafe(query);
@@ -282,7 +339,8 @@ namespace UniGetUI.PackageEngine.Managers.WingetManager
                 executableName => CoreTools.WhichMultiple(executableName),
                 File.Exists,
                 GetBundledPingetExecutablePath(),
-                GetCliToolPreference()
+                GetCliToolPreference(),
+                () => SystemWinGetLocator.EnumerateOffPathExecutables(File.Exists)
             );
         }
 
@@ -290,7 +348,8 @@ namespace UniGetUI.PackageEngine.Managers.WingetManager
             Func<string, IReadOnlyList<string>> findExecutables,
             Func<string, bool> fileExists,
             string bundledPingetPath,
-            WinGetCliToolPreference cliToolPreference = WinGetCliToolPreference.Default
+            WinGetCliToolPreference cliToolPreference = WinGetCliToolPreference.Default,
+            Func<IEnumerable<string>>? findOffPathSystemWinGetFiles = null
         )
         {
             List<string> candidates = [];
@@ -298,6 +357,7 @@ namespace UniGetUI.PackageEngine.Managers.WingetManager
             if (cliToolPreference is not WinGetCliToolPreference.BundledPinget)
             {
                 candidates.AddRange(findExecutables(SystemWinGetExecutableName));
+                candidates.AddRange(findOffPathSystemWinGetFiles?.Invoke() ?? []);
             }
 
             if (cliToolPreference is not WinGetCliToolPreference.SystemWinGet)
@@ -358,9 +418,14 @@ namespace UniGetUI.PackageEngine.Managers.WingetManager
 
         internal IWinGetManagerHelper CreateCliHelperForSelectedCliTool()
         {
+            return CreateCliHelperForSelectedCliTool(Status.ExecutablePath);
+        }
+
+        internal IWinGetManagerHelper CreateCliHelperForSelectedCliTool(string executablePath)
+        {
             return SelectedCliToolKind == WinGetCliToolKind.BundledPinget
-                ? new PingetCliHelper(this, Status.ExecutablePath)
-                : new WinGetCliHelper(this, Status.ExecutablePath);
+                ? new PingetCliHelper(this, executablePath)
+                : new WinGetCliHelper(this, executablePath);
         }
 
         protected override void _loadManagerExecutableFile(
@@ -420,7 +485,7 @@ namespace UniGetUI.PackageEngine.Managers.WingetManager
                 }
 
                 Logger.Warn("WinGet will resort to using WinGetCliHelper()");
-                WinGetHelper.Instance = CreateCliHelperForSelectedCliTool();
+                WinGetHelper.Instance = CreateCliHelperForSelectedCliTool(path);
             }
         }
 
@@ -560,7 +625,7 @@ namespace UniGetUI.PackageEngine.Managers.WingetManager
             bool usesCliHelper = WinGetHelper.Instance is WinGetCliHelper;
             bool usesPingetHelper = WinGetHelper.Instance is PingetCliHelper;
 
-            Process process = new()
+            using Process process = new()
             {
                 StartInfo = new ProcessStartInfo
                 {
@@ -577,7 +642,7 @@ namespace UniGetUI.PackageEngine.Managers.WingetManager
 
             if (CoreTools.IsAdministrator())
             {
-                string WinGetTemp = Path.Join(Path.GetTempPath(), "UniGetUI", "ElevatedWinGetTemp");
+                string WinGetTemp = Path.Join(AppPaths.ScratchDirectory, "ElevatedWinGetTemp");
                 process.StartInfo.Environment["TEMP"] = WinGetTemp;
                 process.StartInfo.Environment["TMP"] = WinGetTemp;
             }
@@ -719,6 +784,7 @@ namespace UniGetUI.PackageEngine.Managers.WingetManager
 
         public override void RefreshPackageIndexes()
         {
+            using var _cliLock = AcquireCliLock();
             using Process p = new()
             {
                 StartInfo = new ProcessStartInfo
@@ -744,7 +810,7 @@ namespace UniGetUI.PackageEngine.Managers.WingetManager
 
             if (CoreTools.IsAdministrator())
             {
-                string WinGetTemp = Path.Join(Path.GetTempPath(), "UniGetUI", "ElevatedWinGetTemp");
+                string WinGetTemp = Path.Join(AppPaths.ScratchDirectory, "ElevatedWinGetTemp");
                 logger.AddToStdErr(
                     $"[WARN] Redirecting %TEMP% folder to {WinGetTemp}, since UniGetUI was run as admin"
                 );
@@ -752,12 +818,19 @@ namespace UniGetUI.PackageEngine.Managers.WingetManager
                 p.StartInfo.Environment["TMP"] = WinGetTemp;
             }
 
-            p.Start();
-            logger.AddToStdOut(p.StandardOutput.ReadToEnd());
-            logger.AddToStdErr(p.StandardError.ReadToEnd());
-            logger.Close(p.ExitCode);
-            p.WaitForExit();
-            p.Close();
+            try
+            {
+                p.Start();
+                logger.AddToStdOut(p.StandardOutput.ReadToEnd());
+                logger.AddToStdErr(p.StandardError.ReadToEnd());
+                logger.Close(p.ExitCode);
+                p.WaitForExit();
+                p.Close();
+            }
+            finally
+            {
+                MarkSourceIndexRefreshed();
+            }
         }
 
         private string GetCliToolProxyArgument()

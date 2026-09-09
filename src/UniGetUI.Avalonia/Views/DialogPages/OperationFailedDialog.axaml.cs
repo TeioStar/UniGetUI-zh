@@ -1,9 +1,10 @@
 using Avalonia;
 using Avalonia.Controls;
-using Avalonia.Controls.Documents;
 using Avalonia.Layout;
 using Avalonia.Media;
+using Avalonia.Styling;
 using Avalonia.Threading;
+using UniGetUI.Avalonia.ViewModels.Pages.LogPages;
 using UniGetUI.Core.Tools;
 using UniGetUI.PackageEngine.Enums;
 using UniGetUI.PackageEngine.Operations;
@@ -11,10 +12,13 @@ using UniGetUI.PackageOperations;
 
 namespace UniGetUI.Avalonia.Views.DialogPages;
 
-public partial class OperationFailedDialog : Window
+public partial class OperationFailedDialog : UniGetUI.Avalonia.Views.DialogPages.ImmersiveDialog
 {
+    private readonly AbstractOperation _operation;
+
     public OperationFailedDialog(AbstractOperation operation)
     {
+        _operation = operation;
         InitializeComponent();
         Title = operation.Metadata.FailureMessage;
 
@@ -24,25 +28,9 @@ public partial class OperationFailedDialog : Window
                 "Please see the Command-line Output or refer to the Operation History for further information about the issue."
             );
 
-        var errorBrush = new SolidColorBrush(Color.Parse("#FF6B6B"));
-        var debugBrush = new SolidColorBrush(Color.Parse("#888888"));
-        var normalBrush = Application.Current?.FindResource("SystemControlForegroundBaseHighBrush") as IBrush
-                          ?? Brushes.White;
-
-        var inlines = OutputText.Inlines ??= new InlineCollection();
-        bool first = true;
-        foreach (var (text, type) in operation.GetOutput())
-        {
-            IBrush brush = type switch
-            {
-                AbstractOperation.LineType.Error => errorBrush,
-                AbstractOperation.LineType.VerboseDetails => debugBrush,
-                _ => normalBrush,
-            };
-            if (!first) inlines.Add(new LineBreak());
-            inlines.Add(new Run(text) { Foreground = brush });
-            first = false;
-        }
+        PopulateOutput();
+        // Line brushes are baked per theme; recolor so they follow a live theme switch.
+        ActualThemeVariantChanged += (_, _) => PopulateOutput();
 
         var closeButton = new Button
         {
@@ -60,10 +48,40 @@ public partial class OperationFailedDialog : Window
         Grid.SetColumn(closeButton, 1);
     }
 
+    private void PopulateOutput()
+    {
+        // Resolve against the actual theme variant; bare FindResource picks the light-theme
+        // foreground (near-black) even in dark mode, making normal lines unreadable (#5032).
+        var theme = Infrastructure.ThemeHelper.Variant;
+        var errorBrush = new SolidColorBrush(Color.Parse("#FF6B6B"));
+        var debugBrush = new SolidColorBrush(Color.Parse("#888888"));
+        var normalBrush = LookupBrush("SystemControlForegroundBaseHighBrush", theme, Brushes.White);
+
+        var lines = new List<LogLineItem>();
+        foreach (var (text, type) in _operation.GetOutput())
+        {
+            IBrush brush = type switch
+            {
+                AbstractOperation.LineType.Error => errorBrush,
+                AbstractOperation.LineType.VerboseDetails => debugBrush,
+                _ => normalBrush,
+            };
+            lines.Add(new LogLineItem(text, brush));
+        }
+        OutputText.SetLines(lines);
+    }
+
+    private static IBrush LookupBrush(string key, ThemeVariant theme, IBrush fallback)
+    {
+        if (Application.Current?.TryGetResource(key, theme, out var resource) == true && resource is IBrush brush)
+            return brush;
+        return fallback;
+    }
+
     protected override void OnOpened(EventArgs e)
     {
         base.OnOpened(e);
-        Dispatcher.UIThread.Post(OutputScroll.ScrollToEnd, DispatcherPriority.Background);
+        Dispatcher.UIThread.Post(OutputText.ScrollToBottom, DispatcherPriority.Background);
     }
 
     private Control BuildRetryButton(AbstractOperation operation)

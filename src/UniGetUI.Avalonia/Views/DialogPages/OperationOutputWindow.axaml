@@ -1,30 +1,25 @@
-<Window xmlns="https://github.com/avaloniaui"
+<dialogs:ImmersiveDialog xmlns="https://github.com/avaloniaui"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:dialogs="using:UniGetUI.Avalonia.Views.DialogPages"
         xmlns:automation="clr-namespace:Avalonia.Automation;assembly=Avalonia.Controls"
         xmlns:vm="using:UniGetUI.Avalonia.ViewModels.DialogPages"
+        xmlns:controls="using:UniGetUI.Avalonia.Views.Controls"
         x:Class="UniGetUI.Avalonia.Views.DialogPages.OperationOutputWindow"
         x:DataType="vm:OperationOutputViewModel"
-        Width="700" MinWidth="400"
-        Height="500" MinHeight="300"
-        CanResize="True"
-        ShowInTaskbar="False"
+        MaxWidth="700"
+        MinWidth="400"
+        MaxHeight="500"
+        MinHeight="300"
         Background="{DynamicResource AppDialogBackground}"
-        WindowStartupLocation="CenterOwner"
         Title="{Binding Title}">
 
-    <ScrollViewer x:Name="OutputScroll"
-                  Margin="8"
-                  HorizontalScrollBarVisibility="Auto"
-                  VerticalScrollBarVisibility="Auto"
-                  Background="{DynamicResource AppDialogDarkBackground}"
-                  CornerRadius="6">
-        <SelectableTextBlock x:Name="OutputText"
-                             Padding="8"
-                             FontFamily="Cascadia Mono,Consolas,Menlo,monospace"
-                             FontSize="12"
-                             TextWrapping="Wrap"
-                             automation:AutomationProperties.Name="{Binding Title}"
-                             automation:AutomationProperties.AccessibilityView="Raw"/>
-    </ScrollViewer>
+    <Border Margin="8"
+            CornerRadius="6"
+            ClipToBounds="True"
+            Background="{DynamicResource AppDialogDarkBackground}">
+        <controls:LogTextEditor x:Name="OutputText"
+                                automation:AutomationProperties.Name="{Binding Title}"
+                                automation:AutomationProperties.AccessibilityView="Raw"/>
+    </Border>
 
-</Window>
+</dialogs:ImmersiveDialog>

@@ -7,6 +7,8 @@ namespace UniGetUI.PackageEngine.Managers.PowerShellManager;
 
 internal sealed class PowerShellPkgOperationHelper : BasePkgOperationHelper
 {
+    internal const string ErrorVariableName = "UniGetUIOperationError";
+
     public PowerShellPkgOperationHelper(PowerShell manager)
         : base(manager) { }
 
@@ -14,6 +16,13 @@ internal sealed class PowerShellPkgOperationHelper : BasePkgOperationHelper
         IPackage package,
         InstallOptions options,
         OperationType operation
+    ) => _getOperationParameters(package, options, operation, standalone: false);
+
+    protected override IReadOnlyList<string> _getOperationParameters(
+        IPackage package,
+        InstallOptions options,
+        OperationType operation,
+        bool standalone
     )
     {
         List<string> parameters =
@@ -33,18 +42,14 @@ internal sealed class PowerShellPkgOperationHelper : BasePkgOperationHelper
             if (options.PreRelease)
                 parameters.Add("-AllowPrerelease");
 
-            if (!package.OverridenOptions.PowerShell_DoNotSetScopeParameter)
+            // Update-Module (PowerShellGet) has no -Scope parameter; only Install-Module accepts it
+            if (operation is OperationType.Install && !package.OverridenOptions.PowerShell_DoNotSetScopeParameter)
             {
-                if (
-                    package.OverridenOptions.Scope == PackageScope.Global
-                    || (
-                        package.OverridenOptions.Scope is null
-                        && options.InstallationScope == PackageScope.Global
-                    )
-                )
-                    parameters.AddRange(["-Scope", "AllUsers"]);
-                else
-                    parameters.AddRange(["-Scope", "CurrentUser"]);
+                // The scope chosen in the options dialog wins; fall back to the auto-detected install scope
+                string scope = options.InstallationScope.Length > 0
+                    ? options.InstallationScope
+                    : package.OverridenOptions.Scope ?? "";
+                parameters.AddRange(["-Scope", scope == PackageScope.Global ? "AllUsers" : "CurrentUser"]);
             }
         }
 
@@ -57,14 +62,37 @@ internal sealed class PowerShellPkgOperationHelper : BasePkgOperationHelper
                 parameters.AddRange(["-RequiredVersion", options.Version]);
         }
 
-        parameters.AddRange(
-            operation switch
-            {
-                OperationType.Update => options.CustomParameters_Update,
-                OperationType.Uninstall => options.CustomParameters_Uninstall,
-                _ => options.CustomParameters_Install,
-            }
+        IReadOnlyList<string> customParameters = operation switch
+        {
+            OperationType.Update => options.CustomParameters_Update,
+            OperationType.Uninstall => options.CustomParameters_Uninstall,
+            _ => options.CustomParameters_Install,
+        };
+
+        bool bindsOwnErrorVariable = customParameters.Any(parameter =>
+            parameter.StartsWith("-ev", StringComparison.OrdinalIgnoreCase)
+            || parameter.StartsWith("-errorv", StringComparison.OrdinalIgnoreCase)
         );
+
+        if (!bindsOwnErrorVariable)
+            parameters.AddRange(["-ErrorVariable", ErrorVariableName]);
+
+        parameters.AddRange(customParameters);
+
+        // The launcher owns the TLS selection and the error check when it is in use. When the call
+        // falls back to -Command, and when the caller needs a command line that stands on its own,
+        // both have to be script fragments in the parameter list as they were before.
+        if (standalone || Manager.Status.OperationCallArgs.Count is 0)
+        {
+            if (operation is not OperationType.Uninstall)
+                parameters.Insert(
+                    0,
+                    "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12;"
+                );
+
+            if (!bindsOwnErrorVariable)
+                parameters.Add($";if(${ErrorVariableName}){{exit(1)}}");
+        }
 
         return parameters;
     }
@@ -91,7 +119,7 @@ internal sealed class PowerShellPkgOperationHelper : BasePkgOperationHelper
         }
 
         if (
-            output_string.Contains("-Scope")
+            output_string.Contains("Scope")
             && output_string.Contains("NamedParameterNotFound")
             && !package.OverridenOptions.PowerShell_DoNotSetScopeParameter
         )

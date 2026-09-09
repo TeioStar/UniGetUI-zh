@@ -26,6 +26,19 @@
             <Setter Property="Background"   Value="{DynamicResource StatusInfoBackground}"/>
             <Setter Property="BorderBrush"  Value="{DynamicResource StatusInfoBorderBrush}"/>
         </Style>
+        <!-- Chrome-less hyperlink button (no fill/border in any state) -->
+        <Style Selector="Button.link /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderBrush" Value="Transparent"/>
+        </Style>
+        <Style Selector="Button.link:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderBrush" Value="Transparent"/>
+        </Style>
+        <Style Selector="Button.link:pressed /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderBrush" Value="Transparent"/>
+        </Style>
     </UserControl.Styles>
 
     <ScrollViewer HorizontalScrollBarVisibility="Disabled" Margin="0,10">
@@ -40,6 +53,7 @@
             <!-- Status section heading -->
             <TextBlock Text="{Binding StatusSectionTitle}"
                        Margin="44,32,4,8"
+                       FontSize="14"
                        FontWeight="SemiBold"/>
 
             <!-- Status banner -->
@@ -55,16 +69,19 @@
                                Opacity="0.85" TextWrapping="Wrap"/>
                     <Button IsVisible="{Binding ShowVersionVisible}"
                             Command="{Binding ShowVersionCommand}"
+                            Classes="link"
                             HorizontalAlignment="Left"
+                            Background="Transparent"
+                            BorderThickness="0"
                             Padding="0"
                             automation:AutomationProperties.Name="{Binding ShowVersionLabel}">
                         <TextBlock Text="{Binding ShowVersionLabel}" Classes="hyperlink"
                                    automation:AutomationProperties.AccessibilityView="Raw"/>
                     </Button>
-                    <TextBlock Text="{Binding VersionText}"
+                    <SelectableTextBlock Text="{Binding VersionText}"
                                IsVisible="{Binding VersionTextVisible}"
-                               FontFamily="Courier New"
-                               FontSize="12"
+                               FontFamily="Consolas,Cascadia Mono,Menlo,monospace"
+                               FontSize="14"
                                TextWrapping="Wrap"/>
                 </StackPanel>
             </Border>
@@ -76,11 +93,11 @@
             <ContentControl x:Name="PathHolder"/>
 
             <!-- Install options heading and panel -->
-            <TextBlock Text="{Binding InstallSectionTitle}" Margin="44,32,4,8" FontWeight="SemiBold"/>
+            <TextBlock Text="{Binding InstallSectionTitle}" Margin="44,32,4,8" FontSize="14" FontWeight="SemiBold"/>
             <ContentControl x:Name="InstallOptionsHolder"/>
 
             <!-- Manager-specific settings heading -->
-            <TextBlock Text="{Binding SettingsSectionTitle}" Margin="44,32,4,8" FontWeight="SemiBold"/>
+            <TextBlock Text="{Binding SettingsSectionTitle}" Margin="44,32,4,8" FontSize="14" FontWeight="SemiBold"/>
 
             <!-- Manager-specific extra controls – built in code-behind -->
             <StackPanel x:Name="ExtraControls"
@@ -89,12 +106,13 @@
 
             <!-- Related settings -->
             <settings:TranslatedTextBlock Text="Related settings"
+                                          FontSize="14"
                                           FontWeight="SemiBold"
                                           Margin="44,32,4,8"
                                           automation:AutomationProperties.HeadingLevel="2"/>
 
-            <!-- Logs link card -->
-            <settings:SettingsPageButton x:Name="ManagerLogs" CornerRadius="8,8,0,0"/>
+            <!-- Logs link card (standalone; Pip overrides to a top tile when the alias warning shows) -->
+            <settings:SettingsPageButton x:Name="ManagerLogs" CornerRadius="8"/>
 
             <!-- Python App Execution Alias warning (pip only) -->
             <settings:SettingsCard x:Name="AppExecutionAliasWarning"

@@ -3,6 +3,7 @@ using Avalonia.Controls;
 using Avalonia.Input.Platform;
 using Avalonia.Layout;
 using Avalonia.Media;
+using Avalonia.Platform.Storage;
 using UniGetUI.Avalonia.Infrastructure;
 using UniGetUI.Avalonia.ViewModels;
 using UniGetUI.Avalonia.ViewModels.Pages.SettingsPages;
@@ -78,7 +79,7 @@ public sealed partial class PackageManagerPage : UserControl, ISettingsPage
 
         var execHint = new TextBlock
         {
-            Text = CoreTools.Translate("Not finding the file you are looking for? Make sure it has been added to path."),
+            Text = CoreTools.Translate("Not finding the file you are looking for? Browse to it or make sure it has been added to PATH."),
             FontSize = 12,
             FontWeight = FontWeight.SemiBold,
             Opacity = 0.7,
@@ -90,10 +91,17 @@ public sealed partial class PackageManagerPage : UserControl, ISettingsPage
         var execCombo = new ComboBox { HorizontalAlignment = HorizontalAlignment.Stretch };
         AutomationProperties.SetName(execCombo, CoreTools.Translate("Select the executable to be used. The following list shows the executables found by UniGetUI"));
         foreach (var path in manager.FindCandidateExecutableFiles())
-            execCombo.Items.Add(path);
+            AddExecutablePathItem(execCombo, path);
 
         string savedPath = CoreSettings.GetDictionaryItem<string, string>(CoreSettings.K.ManagerPaths, manager.Name) ?? "";
+        if (!string.IsNullOrEmpty(savedPath) && File.Exists(savedPath))
+            AddExecutablePathItem(execCombo, savedPath);
         if (string.IsNullOrEmpty(savedPath))
+        {
+            var (found, path) = manager.GetExecutableFile();
+            savedPath = found ? path : "";
+        }
+        else if (!File.Exists(savedPath))
         {
             var (found, path) = manager.GetExecutableFile();
             savedPath = found ? path : "";
@@ -106,8 +114,36 @@ public sealed partial class PackageManagerPage : UserControl, ISettingsPage
                 ViewModel.OnExecutableSelected(selected);
         };
         Grid.SetRow(execCombo, 1);
-        Grid.SetColumnSpan(execCombo, 2);
+        Grid.SetColumn(execCombo, 0);
         execGrid.Children.Add(execCombo);
+
+        var browseExecutableButton = new Button
+        {
+            Content = CoreTools.Translate("Browse..."),
+            IsEnabled = customPathsAllowed,
+            Margin = new Thickness(8, 0, 0, 0),
+        };
+        browseExecutableButton.Click += async (_, _) =>
+        {
+            if (TopLevel.GetTopLevel(this) is not { } topLevel) return;
+            var files = await topLevel.StorageProvider.OpenFilePickerAsync(
+                new FilePickerOpenOptions
+                {
+                    AllowMultiple = false,
+                    Title = CoreTools.Translate("Select executable"),
+                    FileTypeFilter = GetExecutableFileTypeFilter(),
+                });
+            if (files is not [{ } file]) return;
+
+            string? path = file.TryGetLocalPath();
+            if (string.IsNullOrWhiteSpace(path)) return;
+
+            AddExecutablePathItem(execCombo, path);
+            execCombo.SelectedItem = path;
+        };
+        Grid.SetRow(browseExecutableButton, 1);
+        Grid.SetColumn(browseExecutableButton, 1);
+        execGrid.Children.Add(browseExecutableButton);
 
         if (!customPathsAllowed)
         {
@@ -148,7 +184,7 @@ public sealed partial class PackageManagerPage : UserControl, ISettingsPage
         // ── Current path card
         var copyIcon = new SvgIcon
         {
-            Path = "avares://UniGetUI.Avalonia/Assets/Symbols/copy.svg",
+            Path = "avares://UniGetUI/Assets/Symbols/copy.svg",
             Width = 24,
             Height = 24,
         };
@@ -170,7 +206,7 @@ public sealed partial class PackageManagerPage : UserControl, ISettingsPage
         };
         var pathLabel = new TextBlock
         {
-            FontFamily = new FontFamily("Courier New"),
+            FontFamily = new FontFamily("Consolas,Cascadia Mono,Menlo,monospace"),
             FontSize = 14,
             TextWrapping = TextWrapping.Wrap,
         };
@@ -342,6 +378,34 @@ public sealed partial class PackageManagerPage : UserControl, ISettingsPage
         }
     }
 
+    private static IReadOnlyList<FilePickerFileType> GetExecutableFileTypeFilter()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return [new FilePickerFileType(CoreTools.Translate("All files")) { Patterns = ["*"] }];
+        }
+
+        return
+        [
+            new FilePickerFileType(CoreTools.Translate("Executable")) { Patterns = ["*.exe"] },
+            new FilePickerFileType(CoreTools.Translate("All files")) { Patterns = ["*"] },
+        ];
+    }
+
+    private static void AddExecutablePathItem(ComboBox comboBox, string path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            return;
+
+        foreach (object? item in comboBox.Items)
+        {
+            if (string.Equals(item?.ToString(), path, StringComparison.OrdinalIgnoreCase))
+                return;
+        }
+
+        comboBox.Items.Add(path);
+    }
+
     private void BuildExtraControls(CheckboxCard_Dict disableNotifsCard)
     {
         ExtraControls.Children.Clear();
@@ -420,6 +484,25 @@ public sealed partial class PackageManagerPage : UserControl, ISettingsPage
                 {
                     Text = CoreTools.Translate("Force install location parameter when updating packages with custom locations"),
                     SettingName = CoreSettings.K.WinGetForceLocationOnUpdate,
+                    CornerRadius = new CornerRadius(0),
+                    BorderThickness = new Thickness(1, 0, 1, 1),
+                });
+
+                ExtraControls.Children.Add(new CheckboxCard
+                {
+                    Text = CoreTools.Translate("Download full package manifest alongside the installer"),
+                    SettingName = CoreSettings.K.WinGetDownloadFullManifest,
+                    CornerRadius = new CornerRadius(0),
+                    BorderThickness = new Thickness(1, 0, 1, 1),
+                });
+
+                ExtraControls.Children.Add(new TextboxCard
+                {
+                    Text = CoreTools.Translate("Stop offering an update that never applies after this many attempts"),
+                    Description = CoreTools.Translate("When WinGet keeps offering an update that reports success without ever changing the installed version, stop offering it after this many attempts, until a newer version is available (default: 3)"),
+                    SettingName = CoreSettings.K.WinGetStuckUpgradeThreshold,
+                    IsNumericOnly = true,
+                    Placeholder = "3",
                     CornerRadius = new CornerRadius(0, 0, 8, 8),
                     BorderThickness = new Thickness(1, 0, 1, 1),
                 });
@@ -459,12 +542,22 @@ public sealed partial class PackageManagerPage : UserControl, ISettingsPage
                 scoopCleanup.Click += (_, _) => ViewModel.ScoopCleanupCommand.Execute(null);
                 ExtraControls.Children.Add(scoopCleanup);
 
+                // Clear download cache on launch
+                ExtraControls.Children.Add(new CheckboxCard
+                {
+                    CornerRadius = new CornerRadius(0),
+                    BorderThickness = new Thickness(1, 0, 1, 0),
+                    SettingName = CoreSettings.K.EnableScoopCleanupCache,
+                    Text = CoreTools.AutoTranslated("Clear Scoop download cache on launch"),
+                });
+
+                // Clean up older app versions on launch
                 ExtraControls.Children.Add(new CheckboxCard
                 {
                     CornerRadius = new CornerRadius(0, 0, 8, 8),
                     BorderThickness = new Thickness(1, 0, 1, 1),
-                    SettingName = CoreSettings.K.EnableScoopCleanup,
-                    Text = CoreTools.AutoTranslated("Enable Scoop cleanup on launch"),
+                    SettingName = CoreSettings.K.EnableScoopCleanupApps,
+                    Text = CoreTools.AutoTranslated("Clean up older Scoop app versions on launch"),
                 });
                 break;
 

@@ -16,6 +16,10 @@ using UniGetUI.PackageEngine.Interfaces;
 using UniGetUI.PackageEngine.Operations;
 using UniGetUI.PackageEngine.PackageClasses;
 using UniGetUI.PackageEngine.PackageLoader;
+using UniGetUI.PackageOperations;
+#if WINDOWS
+using UniGetUI.PackageEngine.Managers.WingetManager;
+#endif
 
 namespace UniGetUI.Avalonia.Infrastructure;
 
@@ -29,8 +33,8 @@ internal static class AvaloniaPackageOperationHelper
     {
         foreach (var pkg in UpgradablePackagesLoader.Instance.Packages.ToList())
         {
-            if (pkg.Tag is PackageTag.BeingProcessed or PackageTag.OnQueue) continue;
             var opts = await InstallOptionsFactory.LoadApplicableAsync(pkg);
+            if (PackageOperation.HasPendingOperation(pkg, OperationType.Update)) continue;
             var op = new UpdatePackageOperation(pkg, opts);
             op.OperationSucceeded += (_, _) => TelemetryHandler.UpdatePackage(pkg, TEL_OP_RESULT.SUCCESS);
             op.OperationFailed += (_, _) => TelemetryHandler.UpdatePackage(pkg, TEL_OP_RESULT.FAILED);
@@ -45,8 +49,8 @@ internal static class AvaloniaPackageOperationHelper
             .Where(p => p.Manager.Id == managerName)
             .ToList())
         {
-            if (pkg.Tag is PackageTag.BeingProcessed or PackageTag.OnQueue) continue;
             var opts = await InstallOptionsFactory.LoadApplicableAsync(pkg);
+            if (PackageOperation.HasPendingOperation(pkg, OperationType.Update)) continue;
             var op = new UpdatePackageOperation(pkg, opts);
             op.OperationSucceeded += (_, _) => TelemetryHandler.UpdatePackage(pkg, TEL_OP_RESULT.SUCCESS);
             op.OperationFailed += (_, _) => TelemetryHandler.UpdatePackage(pkg, TEL_OP_RESULT.FAILED);
@@ -65,6 +69,7 @@ internal static class AvaloniaPackageOperationHelper
         }
 
         var opts = await InstallOptionsFactory.LoadApplicableAsync(pkg);
+        if (PackageOperation.HasPendingOperation(pkg, OperationType.Update)) return;
         var op = new UpdatePackageOperation(pkg, opts);
         op.OperationSucceeded += (_, _) => TelemetryHandler.UpdatePackage(pkg, TEL_OP_RESULT.SUCCESS);
         op.OperationFailed += (_, _) => TelemetryHandler.UpdatePackage(pkg, TEL_OP_RESULT.FAILED);
@@ -81,6 +86,14 @@ internal static class AvaloniaPackageOperationHelper
         if (package is null) return;
         if (MainWindow.Instance is not { } win) return;
 
+#if WINDOWS
+        if (package.Manager is WinGet && Settings.Get(Settings.K.WinGetDownloadFullManifest))
+        {
+            await AskFolderAndDownloadWinGetManifestAsync(package, referral, win);
+            return;
+        }
+#endif
+
         await package.Details.Load();
 
         if (package.Details.InstallerUrl is null)
@@ -93,8 +106,8 @@ internal static class AvaloniaPackageOperationHelper
         if (string.IsNullOrWhiteSpace(suggestedName))
             suggestedName = CoreTools.MakeValidFileName(package.Id) + ".exe";
 
-        string ext = suggestedName.Contains('.')
-            ? CoreTools.MakeValidFileName(suggestedName.Split('.')[^1])
+        string ext = InstallerFileNaming.ExtractExtension(suggestedName) is { Length: > 1 } extension
+            ? CoreTools.MakeValidFileName(extension[1..])
             : "exe";
 
         var file = await win.StorageProvider.SaveFilePickerAsync(new FilePickerSaveOptions
@@ -141,15 +154,44 @@ internal static class AvaloniaPackageOperationHelper
         var outputPath = folder?.TryGetLocalPath();
         if (outputPath is null) return;
 
+        bool fullManifest = Settings.Get(Settings.K.WinGetDownloadFullManifest);
         foreach (var pkg in eligible)
         {
-            var op = new DownloadOperation(pkg, outputPath);
+            AbstractOperation op;
+#if WINDOWS
+            if (fullManifest && pkg.Manager is WinGet)
+                op = new WinGetManifestDownloadOperation(pkg, outputPath);
+            else
+                op = new DownloadOperation(pkg, outputPath);
+#else
+            op = new DownloadOperation(pkg, outputPath);
+#endif
             op.OperationSucceeded += (_, _) => TelemetryHandler.DownloadPackage(pkg, TEL_OP_RESULT.SUCCESS, referral);
             op.OperationFailed += (_, _) => TelemetryHandler.DownloadPackage(pkg, TEL_OP_RESULT.FAILED, referral);
             AvaloniaOperationRegistry.Add(op);
             _ = op.MainThread();
         }
     }
+
+#if WINDOWS
+    private static async Task AskFolderAndDownloadWinGetManifestAsync(
+        IPackage package,
+        TEL_InstallReferral referral,
+        MainWindow win)
+    {
+        var folders = await win.StorageProvider.OpenFolderPickerAsync(
+            new FolderPickerOpenOptions { AllowMultiple = false });
+        var folder = folders.FirstOrDefault();
+        var outputPath = folder?.TryGetLocalPath();
+        if (outputPath is null) return;
+
+        var op = new WinGetManifestDownloadOperation(package, outputPath);
+        op.OperationSucceeded += (_, _) => TelemetryHandler.DownloadPackage(package, TEL_OP_RESULT.SUCCESS, referral);
+        op.OperationFailed += (_, _) => TelemetryHandler.DownloadPackage(package, TEL_OP_RESULT.FAILED, referral);
+        AvaloniaOperationRegistry.Add(op);
+        _ = op.MainThread();
+    }
+#endif
 
     /// <summary>
     /// Runs the WinGet self-repair sequence elevated and shows a result notification.

@@ -40,7 +40,7 @@ internal sealed class TrayService : IDisposable
         {
             _trayIcon.IsVisible = !Settings.Get(Settings.K.DisableSystemTray);
 
-            string modifier;
+            string status;
             string tooltip;
 
             bool anyRunning = AvaloniaOperationRegistry.Operations.Any(
@@ -50,38 +50,39 @@ internal sealed class TrayService : IDisposable
 
             if (anyRunning)
             {
-                modifier = "_blue";
+                status = "blue";
                 tooltip = CoreTools.Translate("Operation in progress");
             }
             else if (AvaloniaOperationRegistry.ErrorsOccurred > 0)
             {
-                modifier = "_orange";
+                status = "orange";
                 tooltip = CoreTools.Translate("Attention required");
             }
             else if (AvaloniaOperationRegistry.RestartRequired)
             {
-                modifier = "_turquoise";
+                status = "turquoise";
                 tooltip = CoreTools.Translate("Restart required");
             }
             else if (updatesCount > 0)
             {
-                modifier = "_green";
+                status = "green";
                 tooltip = updatesCount == 1
                     ? CoreTools.Translate("1 update is available")
                     : CoreTools.Translate("{0} updates are available", updatesCount);
             }
             else
             {
-                modifier = "_empty";
+                status = "empty";
                 tooltip = CoreTools.Translate("Everything is up to date");
             }
 
             _trayIcon.ToolTipText = tooltip + " - UniGetUI";
 
-            modifier += IsTaskbarLight() ? "_black" : "_white";
-            string suffix = Settings.Get(Settings.K.UseLegacyTrayIcon) ? "_legacy" : "";
+            bool light = IsTaskbarLight();
+            string tone = light ? "_black" : "_white";
 
-            string uri = $"avares://UniGetUI.Avalonia/Assets/tray{modifier}{suffix}.ico";
+            string uri = $"avares://UniGetUI/Assets/tray_{status}{tone}_legacy.ico";
+
             if (_lastIconUri == uri) return;
             _lastIconUri = uri;
 

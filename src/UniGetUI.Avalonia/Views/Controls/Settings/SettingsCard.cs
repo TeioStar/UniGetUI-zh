@@ -6,6 +6,7 @@ using Avalonia.Input;
 using Avalonia.Interactivity;
 using Avalonia.Layout;
 using Avalonia.Media;
+using UniGetUI.Avalonia.Views.Controls;
 using ICommand = System.Windows.Input.ICommand;
 
 namespace UniGetUI.Avalonia.Views.Controls.Settings;
@@ -23,7 +24,7 @@ public class SettingsCard : UserControl
     private readonly ContentControl _descriptionPresenter;
     private readonly ContentControl _contentPresenter;
     private readonly StackPanel _descriptionRow;
-    private readonly TextBlock _chevron;
+    private readonly SvgIcon _chevron;
 
     // ── Styled properties ──────────────────────────────────────────────────
     public static readonly StyledProperty<object?> HeaderProperty =
@@ -55,7 +56,7 @@ public class SettingsCard : UserControl
         {
             _rightContent = value;
             _contentPresenter.Content = value is string s
-                ? new TextBlock { Text = s, VerticalAlignment = VerticalAlignment.Center }
+                ? new TextBlock { Text = s, FontSize = 14, VerticalAlignment = VerticalAlignment.Center }
                 : value;
         }
     }
@@ -117,10 +118,31 @@ public class SettingsCard : UserControl
         set => _border.CornerRadius = value;
     }
 
+    // Base (unfocused) thickness as assigned by the consumer. Grouped cards use a
+    // partial thickness like "1,0,1,1" to share a divider with the card above; we
+    // must remember it so we can restore it when focus leaves.
+    private Thickness _baseBorderThickness = new(1);
+
     public new Thickness BorderThickness
     {
         get => _border.BorderThickness;
-        set => _border.BorderThickness = value;
+        set
+        {
+            _baseBorderThickness = value;
+            // While focused the border is forced complete (see GotFocus); don't clobber it.
+            if (!_border.Classes.Contains("settings-card-focused"))
+                _border.BorderThickness = value;
+        }
+    }
+
+    // A focused card needs a border on all four sides, even when its base thickness omits
+    // the top (grouped cards). The accent focus style can't supply this: BorderThickness is
+    // a local value on _border, which wins over the style setter — so we set it here instead.
+    private static Thickness FocusedBorderThickness(Thickness baseThickness)
+    {
+        double t = Math.Max(Math.Max(baseThickness.Left, baseThickness.Right),
+                            Math.Max(baseThickness.Top, baseThickness.Bottom));
+        return new Thickness(Math.Max(t, 1));
     }
 
     // ── Constructor ────────────────────────────────────────────────────────
@@ -178,10 +200,11 @@ public class SettingsCard : UserControl
             Margin = new Thickness(16, 0, 0, 0),
         };
 
-        _chevron = new TextBlock
+        _chevron = new SvgIcon
         {
-            Text = "›",
-            FontSize = 20,
+            Path = "avares://UniGetUI/Assets/Symbols/forward.svg",
+            Width = 16,
+            Height = 16,
             VerticalAlignment = VerticalAlignment.Center,
             Opacity = 0.6,
             Margin = new Thickness(8, 0, 0, 0),
@@ -214,8 +237,17 @@ public class SettingsCard : UserControl
 
         PointerPressed += OnPointerPressed;
         KeyDown += OnKeyDown;
-        GotFocus += (_, _) => { if (_isClickEnabled) _border.Classes.Add("settings-card-focused"); };
-        LostFocus += (_, _) => _border.Classes.Remove("settings-card-focused");
+        GotFocus += (_, _) =>
+        {
+            if (!_isClickEnabled) return;
+            _border.Classes.Add("settings-card-focused");
+            _border.BorderThickness = FocusedBorderThickness(_baseBorderThickness);
+        };
+        LostFocus += (_, _) =>
+        {
+            _border.Classes.Remove("settings-card-focused");
+            _border.BorderThickness = _baseBorderThickness;
+        };
         SyncAutomationProperties();
     }
 
@@ -229,6 +261,7 @@ public class SettingsCard : UserControl
                 ? new TextBlock
                 {
                     Text = s,
+                    FontSize = 14,
                     TextWrapping = TextWrapping.Wrap,
                     VerticalAlignment = VerticalAlignment.Center,
                 }

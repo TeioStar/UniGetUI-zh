@@ -12,26 +12,29 @@
 
     <Grid RowDefinitions="Auto,Auto,*">
 
-        <!-- Row 0: Header -->
-        <StackPanel Grid.Row="0"
-                    Orientation="Horizontal"
-                    VerticalAlignment="Center"
-                    Margin="16,12,16,8">
+        <!-- Row 0: Header. Title is left-aligned to the settings cards (40px), with the back
+             button sitting in the gutter to its left. -->
+        <Grid Grid.Row="0"
+              VerticalAlignment="Center"
+              Margin="0,12,16,8">
             <Button Command="{Binding BackCommand}"
-                    Margin="0,0,12,0"
+                    HorizontalAlignment="Left"
+                    VerticalAlignment="Center"
+                    Margin="4,0,0,0"
                     Padding="4"
                     Background="Transparent"
                     BorderThickness="0"
                     automation:AutomationProperties.Name="{t:Translate Go back}">
                 <controls:SvgIcon Width="24" Height="24"
-                                  Path="avares://UniGetUI.Avalonia/Assets/Symbols/backward.svg"/>
+                                  Path="avares://UniGetUI/Assets/Symbols/backward.svg"/>
             </Button>
             <TextBlock Text="{Binding Title}"
-                       FontSize="26"
-                       FontWeight="SemiBold"
+                       FontSize="24"
+                       FontWeight="Bold"
                        VerticalAlignment="Center"
+                       Margin="40,0,0,0"
                        automation:AutomationProperties.HeadingLevel="1"/>
-        </StackPanel>
+        </Grid>
 
         <!-- Row 1: Restart-required banner -->
         <Border x:Name="RestartBannerBorder"
@@ -41,25 +44,27 @@
                 Margin="16,0,16,8"
                 Padding="4"
                 IsVisible="{Binding IsRestartBannerVisible}">
-            <StackPanel Orientation="Horizontal"
-                        Margin="8,6">
-                <TextBlock Text="{Binding RestartBannerText}"
+            <Grid ColumnDefinitions="*,Auto"
+                  Margin="8,6">
+                <TextBlock Grid.Column="0" Text="{Binding RestartBannerText}"
+                           FontSize="14"
                            VerticalAlignment="Center"
                            Margin="0,0,16,0"/>
-                <Button Content="{Binding RestartButtonText}"
+                <Button Grid.Column="1" Content="{Binding RestartButtonText}"
                         automation:AutomationProperties.Name="{Binding RestartButtonText}"
                         Command="{Binding RestartAppCommand}"
                         HorizontalAlignment="Right"/>
-            </StackPanel>
+            </Grid>
         </Border>
 
-        <!-- Row 2: Content frame -->
-        <ContentControl x:Name="Frame"
+        <!-- Row 2: Content frame — sub-pages slide in horizontally (WinUI SlideNavigationTransition) -->
+        <TransitioningContentControl x:Name="Frame"
                         Grid.Row="2"
                         HorizontalAlignment="Stretch"
                         VerticalAlignment="Stretch"
                         HorizontalContentAlignment="Stretch"
-                        VerticalContentAlignment="Stretch"/>
+                        VerticalContentAlignment="Stretch"
+                        ClipToBounds="True"/>
 
     </Grid>
 

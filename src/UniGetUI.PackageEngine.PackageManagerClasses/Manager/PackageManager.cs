@@ -1,3 +1,5 @@
+using System.Diagnostics;
+using System.Text;
 using UniGetUI.Core.Logging;
 using UniGetUI.Core.SettingsEngine;
 using UniGetUI.Core.SettingsEngine.SecureSettings;
@@ -41,6 +43,23 @@ namespace UniGetUI.PackageEngine.ManagerClasses.Manager
         public IMultiSourceHelper SourcesHelper { get; protected set; } = new NullSourceHelper();
         public IPackageDetailsHelper DetailsHelper { get; protected set; } = null!;
         public IPackageOperationHelper OperationHelper { get; protected set; } = null!;
+        public virtual Encoding OutputEncoding => Encoding.UTF8;
+        public virtual bool InstallerUrlFollowsPackageVersion => false;
+
+        public virtual bool CommandLineIsShellInterpreted => false;
+
+        public virtual bool IdentifiersAreQuotedOnCommandLine => false;
+
+        public virtual int? CompareVersions(string versionA, string versionB)
+        {
+            var parsedA = CoreTools.VersionStringToStruct(versionA);
+            var parsedB = CoreTools.VersionStringToStruct(versionB);
+
+            if (parsedA == CoreTools.Version.Null || parsedB == CoreTools.Version.Null)
+                return null;
+
+            return parsedA.CompareTo(parsedB);
+        }
 
         private readonly bool _baseConstructorCalled;
         private bool _ready;
@@ -63,6 +82,19 @@ namespace UniGetUI.PackageEngine.ManagerClasses.Manager
         );
         protected abstract void _loadManagerVersion(out string version);
 
+        /// <summary>
+        /// The argument vector that precedes the operation parameters, for managers whose command
+        /// line must be built with <see cref="System.Diagnostics.ProcessStartInfo.ArgumentList"/>
+        /// instead of a single concatenated string. An empty vector selects the concatenated
+        /// <see cref="ManagerStatus.ExecutableCallArgs"/> path.
+        /// </summary>
+        protected virtual IReadOnlyList<string> _getOperationCallArgs(
+            string executablePath,
+            string callArguments
+        ) => [];
+
+        protected virtual void _performPreInitializationSteps() { }
+
         protected virtual void _performExtraLoadingSteps() { }
 
         public virtual void Initialize()
@@ -71,6 +103,7 @@ namespace UniGetUI.PackageEngine.ManagerClasses.Manager
             {
                 _ready = false;
                 _ensurePropertlyConstructed();
+                _performPreInitializationSteps();
 
                 if (!IsEnabled())
                 { // Do NOT initialise disabled package managers
@@ -101,6 +134,8 @@ namespace UniGetUI.PackageEngine.ManagerClasses.Manager
                 }
 
                 Logger.ImportantInfo($"{Name} is enabled and was found on {path}");
+
+                Status.OperationCallArgs = _getOperationCallArgs(path, callArguments);
 
                 // Load manager version
                 _loadManagerVersion(out string version);
@@ -194,15 +229,16 @@ namespace UniGetUI.PackageEngine.ManagerClasses.Manager
         public Tuple<bool, string> GetExecutableFile()
         {
             var candidates = FindCandidateExecutableFiles();
-            if (candidates.Count == 0)
-            {
-                // No paths were found
-                return new(false, "");
-            }
 
             // If custom package manager paths are DISABLED, get the first one (as old UniGetUI did) and return it.
             if (!SecureSettings.Get(SecureSettings.K.AllowCustomManagerPaths))
             {
+                if (candidates.Count == 0)
+                {
+                    // No paths were found
+                    return new(false, "");
+                }
+
                 return new(true, candidates[0]);
             }
             else
@@ -214,32 +250,33 @@ namespace UniGetUI.PackageEngine.ManagerClasses.Manager
                 // If there is no executable selection for this package manager
                 if (string.IsNullOrEmpty(exeSelection))
                 {
+                    if (candidates.Count == 0)
+                    {
+                        // No paths were found
+                        return new(false, "");
+                    }
+
                     return new(true, candidates[0]);
                 }
                 else if (!File.Exists(exeSelection))
                 {
                     Logger.Error(
-                        $"The selected executable path {exeSelection} for manager {Name} does not exist, the default one will be used..."
+                        $"The selected executable path {exeSelection} for manager {Name} does not exist, the default one will be used if available..."
                     );
-                    return new(true, candidates[0]);
                 }
 
-                // While technically executables that are not in the path should work,
-                // since detection of executables will be performed on the found paths, it is more consistent
-                // to throw an error when a non-found executable is used. Furthermore, doing this we can filter out
-                // any invalid paths or files.
-                if (candidates.Select(x => x.ToLower()).Contains(exeSelection.ToLower()))
+                else
                 {
                     return new(true, exeSelection);
                 }
-                else
+
+                if (candidates.Count == 0)
                 {
-                    Logger.Error(
-                        $"The selected executable path {exeSelection} for manager {Name} was not found among the candidates "
-                            + $"(executables found are [{string.Join(',', candidates)}]), the default will be used..."
-                    );
-                    return new(true, candidates[0]);
+                    // No paths were found
+                    return new(false, "");
                 }
+
+                return new(true, candidates[0]);
             }
         }
 
@@ -259,6 +296,105 @@ namespace UniGetUI.PackageEngine.ManagerClasses.Manager
             return _ready && IsEnabled() && Status.Found;
         }
 
+        // Opt out (override => false) when AttemptFastRepair can't recover a timed-out query (issue #4974).
+        protected virtual bool RetryListingTasksOnTimeout => true;
+
+        // Processes started by the current listing task, so a timeout can kill them instead of orphaning them.
+        private readonly AsyncLocal<List<Process>?> _listingProcesses = new();
+
+        // Lets a listing task register a process for kill-on-timeout. No-op when outside a listing task.
+        protected void RegisterListingProcess(Process process)
+        {
+            List<Process>? processes = _listingProcesses.Value;
+            if (processes is null)
+                return;
+            lock (processes)
+                processes.Add(process);
+        }
+
+        private static void KillListingProcesses(List<Process> processes)
+        {
+            lock (processes)
+                foreach (Process p in processes)
+                {
+                    try
+                    {
+                        if (!p.HasExited)
+                            p.Kill(entireProcessTree: true);
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Warn($"Could not kill a timed-out process tree: {ex.Message}");
+                    }
+                }
+        }
+
+        private void RefreshPackageIndexesSafely()
+        {
+            try
+            {
+                RunListingTaskWithTimeout<object?>(
+                    () =>
+                    {
+                        RefreshPackageIndexes();
+                        return null;
+                    },
+                    "RefreshPackageIndexes",
+                    allowDisablingTimeout: false
+                );
+            }
+            catch (Exception e)
+            {
+                while (e is AggregateException)
+                    e = e.InnerException ?? new InvalidOperationException("How did we get here?");
+
+                Logger.Warn(
+                    $"Manager {DisplayName} could not refresh its package indexes "
+                        + $"({e.GetType().Name}: {e.Message}). The available updates will be listed "
+                        + "with the indexes as they are, which may result in an incomplete list."
+                );
+            }
+        }
+
+        private T RunListingTaskWithTimeout<T>(
+            Func<T> method,
+            string taskName,
+            bool allowDisablingTimeout = true
+        )
+        {
+            List<Process> processes = [];
+            var task = Task.Run(() =>
+            {
+                _listingProcesses.Value = processes;
+                return method();
+            });
+
+            if (!task.Wait(TimeSpan.FromSeconds(PackageListingTaskTimeout)))
+            {
+                if (
+                    !allowDisablingTimeout
+                    || !Settings.Get(Settings.K.DisableTimeoutOnPackageListingTasks)
+                )
+                {
+                    KillListingProcesses(processes);
+                    CoreTools.FinalizeDangerousTask(task);
+                    throw new TimeoutException(
+                        $"Task {taskName} for manager {Name} did not finish after "
+                            + $"{PackageListingTaskTimeout} seconds, aborting."
+                            + (
+                                allowDisablingTimeout
+                                    ? "  You may disable timeouts from UniGetUI Advanced Settings"
+                                    : ""
+                            )
+                    );
+                }
+
+                task.Wait();
+            }
+
+            return task.GetAwaiter().GetResult();
+        }
+
         /// <summary>
         /// Returns an array of Package objects that the manager lists for the given query. Depending on the manager, the list may
         /// also include similar results. This method is fail-safe and will return an empty array if an error occurs.
@@ -274,23 +410,10 @@ namespace UniGetUI.PackageEngine.ManagerClasses.Manager
             }
             try
             {
-                var task = Task.Run(() => FindPackages_UnSafe(query));
-                if (!task.Wait(TimeSpan.FromSeconds(PackageListingTaskTimeout)))
-                {
-                    if (!Settings.Get(Settings.K.DisableTimeoutOnPackageListingTasks))
-                    {
-                        CoreTools.FinalizeDangerousTask(task);
-                        throw new TimeoutException(
-                            $"Task _getInstalledPackages for manager {Name} did not finish after "
-                                + $"{PackageListingTaskTimeout} seconds, aborting.  You may disable "
-                                + $"timeouts from UniGetUI Advanced Settings"
-                        );
-                    }
-
-                    task.Wait();
-                }
-
-                var packages = task.GetAwaiter().GetResult();
+                var packages = RunListingTaskWithTimeout(
+                    () => FindPackages_UnSafe(query),
+                    "_findPackages"
+                );
                 Logger.Info(
                     $"Found {packages.Count} available packages from {Name} with the query {query}"
                 );
@@ -298,12 +421,11 @@ namespace UniGetUI.PackageEngine.ManagerClasses.Manager
             }
             catch (Exception e)
             {
-                if (!SecondAttempt)
+                while (e is AggregateException)
+                    e = e.InnerException ?? new InvalidOperationException("How did we get here?");
+
+                if (!SecondAttempt && (RetryListingTasksOnTimeout || e is not TimeoutException))
                 {
-                    while (e is AggregateException)
-                        e =
-                            e.InnerException
-                            ?? new InvalidOperationException("How did we get here?");
                     Logger.Warn(
                         $"Manager {DisplayName} failed to find packages with exception {e.GetType().Name}: {e.Message}"
                     );
@@ -324,7 +446,13 @@ namespace UniGetUI.PackageEngine.ManagerClasses.Manager
         /// Returns an array of UpgradablePackage objects that represent the available updates reported by the manager.
         /// This method is fail-safe and will return an empty array if an error occurs.
         /// </summary>
-        public IReadOnlyList<IPackage> GetAvailableUpdates() => _getAvailableUpdates(false);
+        public bool LastUpdatesListingFailed { get; private set; }
+
+        public IReadOnlyList<IPackage> GetAvailableUpdates()
+        {
+            LastUpdatesListingFailed = false;
+            return _getAvailableUpdates(false);
+        }
 
         private IReadOnlyList<IPackage> _getAvailableUpdates(bool SecondAttempt)
         {
@@ -335,37 +463,25 @@ namespace UniGetUI.PackageEngine.ManagerClasses.Manager
             }
             try
             {
-                Task.Run(RefreshPackageIndexes)
-                    .Wait(TimeSpan.FromSeconds(PackageListingTaskTimeout));
-
-                var task = Task.Run(GetAvailableUpdates_UnSafe);
-                if (!task.Wait(TimeSpan.FromSeconds(PackageListingTaskTimeout)))
+                if (!SecondAttempt)
                 {
-                    if (!Settings.Get(Settings.K.DisableTimeoutOnPackageListingTasks))
-                    {
-                        CoreTools.FinalizeDangerousTask(task);
-                        throw new TimeoutException(
-                            $"Task _getInstalledPackages for manager {Name} did not finish after "
-                                + $"{PackageListingTaskTimeout} seconds, aborting.  You may disable "
-                                + $"timeouts from UniGetUI Advanced Settings"
-                        );
-                    }
-
-                    task.Wait();
+                    RefreshPackageIndexesSafely();
                 }
 
-                var packages = task.GetAwaiter().GetResult();
+                var packages = RunListingTaskWithTimeout(
+                    GetAvailableUpdates_UnSafe,
+                    "_getAvailableUpdates"
+                );
                 Logger.Info($"Found {packages.Count} available updates from {Name}");
                 return packages;
             }
             catch (Exception e)
             {
-                if (!SecondAttempt)
+                while (e is AggregateException)
+                    e = e.InnerException ?? new InvalidOperationException("How did we get here?");
+
+                if (!SecondAttempt && (RetryListingTasksOnTimeout || e is not TimeoutException))
                 {
-                    while (e is AggregateException)
-                        e =
-                            e.InnerException
-                            ?? new InvalidOperationException("How did we get here?");
                     Logger.Warn(
                         $"Manager {DisplayName} failed to list available updates with exception {e.GetType().Name}: {e.Message}"
                     );
@@ -378,6 +494,7 @@ namespace UniGetUI.PackageEngine.ManagerClasses.Manager
 
                 Logger.Error("Error finding updates on manager " + Name);
                 Logger.Error(e);
+                LastUpdatesListingFailed = true;
                 return [];
             }
         }
@@ -386,7 +503,13 @@ namespace UniGetUI.PackageEngine.ManagerClasses.Manager
         /// Returns an array of Package objects that represent the installed reported by the manager.
         /// This method is fail-safe and will return an empty array if an error occurs.
         /// </summary>
-        public IReadOnlyList<IPackage> GetInstalledPackages() => _getInstalledPackages(false);
+        public bool LastInstalledListingFailed { get; private set; }
+
+        public IReadOnlyList<IPackage> GetInstalledPackages()
+        {
+            LastInstalledListingFailed = false;
+            return _getInstalledPackages(false);
+        }
 
         private IReadOnlyList<IPackage> _getInstalledPackages(bool SecondAttempt)
         {
@@ -397,34 +520,20 @@ namespace UniGetUI.PackageEngine.ManagerClasses.Manager
             }
             try
             {
-                var task = Task.Run(GetInstalledPackages_UnSafe);
-                if (!task.Wait(TimeSpan.FromSeconds(PackageListingTaskTimeout)))
-                {
-                    if (!Settings.Get(Settings.K.DisableTimeoutOnPackageListingTasks))
-                    {
-                        CoreTools.FinalizeDangerousTask(task);
-                        throw new TimeoutException(
-                            $"Task _getInstalledPackages for manager {Name} did not finish after "
-                                + $"{PackageListingTaskTimeout} seconds, aborting.  You may disable "
-                                + $"timeouts from UniGetUI Advanced Settings"
-                        );
-                    }
-
-                    task.Wait();
-                }
-
-                var packages = task.GetAwaiter().GetResult();
+                var packages = RunListingTaskWithTimeout(
+                    GetInstalledPackages_UnSafe,
+                    "_getInstalledPackages"
+                );
                 Logger.Info($"Found {packages.Count} installed packages from {Name}");
                 return packages;
             }
             catch (Exception e)
             {
-                if (!SecondAttempt)
+                while (e is AggregateException)
+                    e = e.InnerException ?? new InvalidOperationException("How did we get here?");
+
+                if (!SecondAttempt && (RetryListingTasksOnTimeout || e is not TimeoutException))
                 {
-                    while (e is AggregateException)
-                        e =
-                            e.InnerException
-                            ?? new InvalidOperationException("How did we get here?");
                     Logger.Warn(
                         $"Manager {DisplayName} failed to list installed packages with exception {e.GetType().Name}: {e.Message}"
                     );
@@ -437,6 +546,7 @@ namespace UniGetUI.PackageEngine.ManagerClasses.Manager
 
                 Logger.Error("Error finding installed packages on manager " + Name);
                 Logger.Error(e);
+                LastInstalledListingFailed = true;
                 return [];
             }
         }

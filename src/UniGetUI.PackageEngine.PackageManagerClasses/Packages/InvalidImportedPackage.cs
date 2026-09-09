@@ -45,6 +45,9 @@ namespace UniGetUI.PackageEngine.PackageClasses
 
         public string Id { get; }
 
+        // An incompatible package cannot be operated on, so it never reaches a command line.
+        public bool HasConcreteVersion => false;
+
         public string VersionString { get; }
 
         public CoreTools.Version NormalizedVersion { get; }
@@ -199,7 +202,7 @@ namespace UniGetUI.PackageEngine.PackageClasses
             return Task.FromResult<string?>("");
         }
 
-        public bool IsUpdateMinor()
+        public bool IsUpdateMinor(int level = InstallOptions.DefaultSkipMinorLevel)
         {
             return false;
         }

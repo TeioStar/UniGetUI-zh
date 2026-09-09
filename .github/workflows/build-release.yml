@@ -22,6 +22,9 @@ on:
         type: boolean
         default: true
 
+env:
+  LINUX_GLIBC_BASELINE: '2.27'
+
 jobs:
   preflight:
     name: Preflight
@@ -36,7 +39,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Resolve build parameters
         id: info
@@ -101,7 +104,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Validate GitHub OAuth secrets
         shell: pwsh
@@ -117,12 +120,12 @@ jobs:
           Write-Host "::notice::GitHub OAuth secrets are configured for this build."
 
       - name: Install .NET
-        uses: actions/setup-dotnet@v5
+        uses: actions/setup-dotnet@v6
         with:
           global-json-file: global.json
 
       - name: Cache NuGet packages
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ${{ env.NUGET_PACKAGES }}
           key: ${{ runner.os }}-nuget-${{ hashFiles('global.json', 'src/**/*.csproj', 'src/**/*.props', 'src/**/*.targets', 'src/**/*.sln', 'src/**/*.slnx') }}
@@ -130,7 +133,7 @@ jobs:
             ${{ runner.os }}-nuget-
 
       - name: Install Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: '3.x'
 
@@ -166,11 +169,13 @@ jobs:
         working-directory: src
         shell: pwsh
         run: |
+          dotnet build-server shutdown
           # Retry once to handle flaky tests (e.g. TaskRecyclerTests uses Random)
-          dotnet test UniGetUI.Windows.slnx --no-restore --verbosity q --nologo /p:Platform=x64
+          dotnet test UniGetUI.Windows.slnx --no-restore --verbosity q --nologo /p:Platform=x64 /p:UseSharedCompilation=false /m:1
           if ($LASTEXITCODE -ne 0) {
             Write-Host "::warning::First test run failed, retrying..."
-            dotnet test UniGetUI.Windows.slnx --no-restore --verbosity q --nologo /p:Platform=x64
+            dotnet build-server shutdown
+            dotnet test UniGetUI.Windows.slnx --no-restore --verbosity q --nologo /p:Platform=x64 /p:UseSharedCompilation=false /m:1
             if ($LASTEXITCODE -ne 0) { exit 1 }
           }
 
@@ -178,23 +183,41 @@ jobs:
         shell: pwsh
         run: |
           $Platform = '${{ matrix.platform }}'
-          [xml]$BuildProps = Get-Content "src/Directory.Build.props"
-          $PortableTargetFramework = @($BuildProps.Project.PropertyGroup | Where-Object { $_.PortableTargetFramework } | Select-Object -First 1).PortableTargetFramework
-          $WindowsTargetPlatformVersion = @($BuildProps.Project.PropertyGroup | Where-Object { $_.WindowsTargetPlatformVersion } | Select-Object -First 1).WindowsTargetPlatformVersion
+          $TargetFramework = (
+            dotnet msbuild src/UniGetUI.Avalonia/UniGetUI.Avalonia.csproj `
+              /nologo `
+              -getProperty:TargetFramework `
+              /p:Configuration=Release `
+              /p:Platform=$Platform `
+              /p:RuntimeIdentifier=win-$Platform |
+              Select-Object -Last 1
+          ).Trim()
 
-          if ([string]::IsNullOrWhiteSpace($PortableTargetFramework) -or [string]::IsNullOrWhiteSpace($WindowsTargetPlatformVersion)) {
-            throw "Could not resolve the target framework from src/Directory.Build.props"
+          if ([string]::IsNullOrWhiteSpace($TargetFramework)) {
+            throw "Could not resolve the Avalonia target framework from MSBuild"
           }
 
-          $TargetFramework = "$PortableTargetFramework-windows$WindowsTargetPlatformVersion"
-          dotnet publish src/UniGetUI/UniGetUI.csproj /noLogo /p:Configuration=Release /p:Platform=$Platform -p:RuntimeIdentifier=win-$Platform -v m
-          if ($LASTEXITCODE -ne 0) { throw "dotnet publish WinUI failed" }
+          dotnet publish src/UniGetUI.Avalonia/UniGetUI.Avalonia.csproj `
+            /noLogo `
+            /p:Configuration=Release `
+            /p:Platform=$Platform `
+            /p:RuntimeIdentifier=win-$Platform `
+            /p:PublishProfile=Win-$Platform-NativeAot `
+            /p:UseSharedCompilation=false `
+            /p:BuildInParallel=false `
+            /m:1 `
+            -v m
+          if ($LASTEXITCODE -ne 0) { throw "dotnet publish Avalonia failed" }
 
           # Stage binaries
-          $PublishDir = "src/UniGetUI/bin/$Platform/Release/$TargetFramework/win-$Platform/publish"
+          $PublishDir = "src/UniGetUI.Avalonia/bin/$Platform/Release/$TargetFramework/win-$Platform/publish"
           if (Test-Path "unigetui_bin") { Remove-Item "unigetui_bin" -Recurse -Force }
           New-Item "unigetui_bin" -ItemType Directory | Out-Null
           Get-ChildItem $PublishDir | Move-Item -Destination "unigetui_bin" -Force
+
+          if (-not (Test-Path "unigetui_bin/UniGetUI.exe")) {
+            throw "Windows app host was not produced at unigetui_bin/UniGetUI.exe"
+          }
 
           $MaxShippedPdbSizeBytes = 1MB
           $PdbsToRemove = Get-ChildItem "unigetui_bin" -Filter "*.pdb" -File -Recurse | Where-Object {
@@ -206,9 +229,6 @@ jobs:
             $PdbsToRemove | Remove-Item -Force
             Write-Host ("Removed {0} oversized PDBs above {1:N2} MiB ({2:N2} MiB total)." -f $PdbsToRemove.Count, ($MaxShippedPdbSizeBytes / 1MB), ($RemovedPdbBytes / 1MB))
           }
-
-          # Backward-compat alias
-          Copy-Item "unigetui_bin/UniGetUI.exe" "unigetui_bin/WingetUI.exe" -Force
 
       - name: Code-sign binaries
         if: ${{ fromJSON(needs.preflight.outputs.dry-run) == false }}
@@ -252,7 +272,13 @@ jobs:
             Set-Content $IssPath $issContentNoSign -NoNewline
 
             $InstallerBaseName = "UniGetUI.Installer.$Platform"
-            & ISCC.exe $IssPath /F"$InstallerBaseName" /O"$OutputDir"
+            $IsccArgs = @($IssPath, "/F$InstallerBaseName", "/O$OutputDir")
+            if ([System.Boolean]::Parse('${{ needs.preflight.outputs.dry-run }}') -eq $false) {
+              Write-Host "Using lzma/ultra64 installer compression for release build."
+              $IsccArgs = @('/DInstallerCompression=lzma/ultra64') + $IsccArgs
+            }
+
+            & ISCC.exe @IsccArgs
             if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE" }
           }
           finally {
@@ -269,8 +295,29 @@ jobs:
 
           # Zip
           Compress-Archive -Path "unigetui_bin/*" -DestinationPath "output/UniGetUI.$Platform.zip" -CompressionLevel Optimal
+          Compress-Archive -Path "InstallerExtras/ForceUniGetUIPortable" -DestinationPath "output/UniGetUI.$Platform.zip" -Update
 
           # Installer is created in output during the previous step
+
+      - name: Capture artifact sizes
+        shell: pwsh
+        run: |
+          $Platform = '${{ matrix.platform }}'
+          $SizesFile = "output/sizes.$Platform.json"
+          $UncompressedSize = (Get-ChildItem "unigetui_bin" -Recurse -File | Measure-Object -Property Length -Sum).Sum
+          $Artifacts = Get-ChildItem "output" -File | Where-Object { $_.Name -ne "sizes.$Platform.json" } | ForEach-Object {
+            @{ Name = $_.Name; SizeBytes = $_.Length }
+          }
+          $Report = @{
+            Platform = $Platform
+            RuntimeIdentifier = "win-$Platform"
+            UncompressedSizeBytes = $UncompressedSize
+            Artifacts = $Artifacts
+            Timestamp = [DateTimeOffset]::UtcNow.ToString("o")
+          }
+          $Report | ConvertTo-Json -Depth 4 | Set-Content $SizesFile -Encoding UTF8
+          Write-Host "Artifact sizes saved to $SizesFile"
+          Get-Content $SizesFile
 
       - name: Code-sign installer
         if: ${{ fromJSON(needs.preflight.outputs.dry-run) == false }}
@@ -319,32 +366,66 @@ jobs:
           - os: macos-latest
             name: macos-arm64
             runtime: osx-arm64
+            publish_profile: osx-arm64-NativeAot
           - os: macos-latest
             name: macos-x64
             runtime: osx-x64
+            publish_profile: osx-x64-NativeAot
           - os: ubuntu-latest
             name: linux-x64
             runtime: linux-x64
+            publish_profile: linux-x64-NativeAot
+            cross_image_arch: amd64
+            cross_sysroot: /crossrootfs/x64
           - os: ubuntu-latest
             name: linux-arm64
             runtime: linux-arm64
+            publish_profile: linux-arm64-NativeAot
+            cross_image_arch: arm64
+            cross_sysroot: /crossrootfs/arm64
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install .NET
-        uses: actions/setup-dotnet@v5
+        uses: actions/setup-dotnet@v6
         with:
           global-json-file: global.json
 
       - name: Cache NuGet packages
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ${{ env.NUGET_PACKAGES }}
           key: ${{ runner.os }}-nuget-${{ hashFiles('global.json', 'src/**/*.csproj', 'src/**/*.props', 'src/**/*.targets', 'src/**/*.sln', 'src/**/*.slnx') }}
           restore-keys: |
             ${{ runner.os }}-nuget-
+
+      - name: Free disk space for cross-build images
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo rm -rf /usr/local/lib/android /opt/ghc || true
+          df -h /
+
+      - name: Build Linux cross-compilation image
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDK_TAG="$(jq -er '.sdk.version' global.json)"
+
+          docker build --pull --build-arg "SDK_TAG=$SDK_TAG" -t unigetui-cross-build - <<'DOCKERFILE'
+          ARG SDK_TAG
+          FROM mcr.microsoft.com/dotnet/sdk:${SDK_TAG} AS sdk
+
+          FROM mcr.microsoft.com/dotnet-buildtools/prereqs:azurelinux-3.0-net10.0-cross-${{ matrix.cross_image_arch }}
+          COPY --from=sdk /usr/share/dotnet /usr/share/dotnet
+          ENV DOTNET_ROOT=/usr/share/dotnet
+          ENV PATH=/usr/share/dotnet:$PATH
+          ENV DOTNET_NOLOGO=true
+          DOCKERFILE
 
       - name: Set version
         shell: pwsh
@@ -353,17 +434,82 @@ jobs:
           ./scripts/set-version.ps1 -Version $PackageVersion
 
       - name: Restore dependencies
+        if: runner.os != 'Linux'
         working-directory: src
         run: dotnet restore UniGetUI.Avalonia/UniGetUI.Avalonia.csproj --runtime ${{ matrix.runtime }}
 
       - name: Publish
+        if: runner.os != 'Linux'
         working-directory: src
+        shell: pwsh
         run: |
-          dotnet publish UniGetUI.Avalonia/UniGetUI.Avalonia.csproj \
-            --configuration Release \
-            --runtime ${{ matrix.runtime }} \
-            --self-contained true \
+          $PublishProfile = '${{ matrix.publish_profile }}'
+          $PublishArgs = @(
+            'publish',
+            'UniGetUI.Avalonia/UniGetUI.Avalonia.csproj',
+            '--configuration', 'Release',
+            '--runtime', '${{ matrix.runtime }}',
+            '--self-contained', 'true',
+            '--output', '../bin/${{ matrix.name }}'
+          )
+          if ($PublishProfile) {
+            $PublishArgs += "/p:PublishProfile=$PublishProfile"
+          }
+          dotnet @PublishArgs
+
+      - name: Publish (Linux cross-build container)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DOCKER_ARGS=(
+            --rm
+            --user "$(id -u):$(id -g)"
+            --volume "${{ github.workspace }}:/source"
+            --workdir /source/src
+            --env HOME=/tmp
+            --env DOTNET_CLI_HOME=/tmp
+            --env NUGET_PACKAGES=/source/.nuget/packages
+            --env UNIGETUI_GITHUB_CLIENT_ID
+            --env UNIGETUI_GITHUB_CLIENT_SECRET
+            --env UNIGETUI_OPENSEARCH_USERNAME
+            --env UNIGETUI_OPENSEARCH_PASSWORD
+          )
+
+          PUBLISH_ARGS=(
+            publish UniGetUI.Avalonia/UniGetUI.Avalonia.csproj
+            --configuration Release
+            --runtime ${{ matrix.runtime }}
+            --self-contained true
             --output ../bin/${{ matrix.name }}
+            /p:PublishProfile=${{ matrix.publish_profile }}
+            /p:SysRoot=${{ matrix.cross_sysroot }}
+            /p:LinkerFlavor=lld
+          )
+
+          docker run "${DOCKER_ARGS[@]}" unigetui-cross-build dotnet "${PUBLISH_ARGS[@]}"
+
+      - name: Remove oversized Linux debug symbols
+        if: runner.os == 'Linux'
+        shell: pwsh
+        run: |
+          $PublishDir = "bin/${{ matrix.name }}"
+          $MaxDebugSymbolSizeBytes = 1MB
+          $DebugSymbolsToRemove = @(Get-ChildItem $PublishDir -Include "*.dbg", "*.pdb" -File -Recurse | Where-Object {
+            $_.Length -gt $MaxDebugSymbolSizeBytes
+          })
+
+          if ($DebugSymbolsToRemove.Count -gt 0) {
+            $RemovedDebugSymbolBytes = ($DebugSymbolsToRemove | Measure-Object -Property Length -Sum).Sum
+            $DebugSymbolsToRemove | Remove-Item -Force
+            Write-Host ("Removed {0} oversized Linux debug symbols above {1:N2} MiB ({2:N2} MiB total)." -f $DebugSymbolsToRemove.Count, ($MaxDebugSymbolSizeBytes / 1MB), ($RemovedDebugSymbolBytes / 1MB))
+          }
+
+      - name: Verify Linux glibc baseline
+        if: runner.os == 'Linux'
+        shell: pwsh
+        run: ./scripts/check-linux-glibc.ps1 -Path "bin/${{ matrix.name }}" -MaxVersion '${{ env.LINUX_GLIBC_BASELINE }}'
 
       - name: Install macOS packaging tools
         if: runner.os == 'macOS'
@@ -371,7 +517,7 @@ jobs:
 
       - name: Check out Devolutions/actions
         if: ${{ runner.os == 'macOS' && fromJSON(needs.preflight.outputs.dry-run) == false }}
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: Devolutions/actions
           ref: v1
@@ -391,7 +537,7 @@ jobs:
           set -euo pipefail
           VERSION='${{ needs.preflight.outputs.package-version }}'
           APP_BUNDLE="UniGetUI.app"
-          APP_EXECUTABLE="UniGetUI.Avalonia"
+          APP_EXECUTABLE="UniGetUI"
           DRY_RUN='${{ needs.preflight.outputs.dry-run }}'
 
           rm -rf "${APP_BUNDLE}" output
@@ -405,6 +551,17 @@ jobs:
           sed "s|@VERSION@|${VERSION}|g" \
             scripts/macos/Info.plist \
             > "${APP_BUNDLE}/Contents/Info.plist"
+          # Compile the appearance-aware app icon (Default/Dark/Tinted/Clear) from the Icon Composer
+          # .icon into the bundle: produces Assets.car + AppIcon.icns. Info.plist already declares
+          # CFBundleIconName=AppIcon, so macOS renders the appearance styles itself (incl. when closed).
+          xcrun actool scripts/macos/AppIcon.icon \
+            --compile "${APP_BUNDLE}/Contents/Resources" \
+            --app-icon AppIcon \
+            --output-partial-info-plist "$(mktemp).plist" \
+            --platform macosx \
+            --minimum-deployment-target 12.0 \
+            --errors --warnings
+          # Static .icns fallback for macOS < 26 (CFBundleIconFile) and the dmg volume icon.
           cp scripts/macos/UniGetUI.icns "${APP_BUNDLE}/Contents/Resources/"
 
           if [ "$DRY_RUN" = "false" ]; then
@@ -509,6 +666,28 @@ jobs:
               -Iteration    $RpmIteration `
               -Architecture $RpmArch
 
+      - name: Capture artifact sizes
+        shell: pwsh
+        run: |
+          $Name = '${{ matrix.name }}'
+          $Runtime = '${{ matrix.runtime }}'
+          $SizesFile = "output/sizes.$Name.json"
+          $SourceDir = if ('${{ runner.os }}' -eq 'macOS') { "UniGetUI.app/Contents/MacOS" } else { "bin/$Name" }
+          $UncompressedSize = (Get-ChildItem $SourceDir -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+          $Artifacts = Get-ChildItem "output" -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne "sizes.$Name.json" } | ForEach-Object {
+            @{ Name = $_.Name; SizeBytes = $_.Length }
+          }
+          $Report = @{
+            Platform = $Name
+            RuntimeIdentifier = $Runtime
+            UncompressedSizeBytes = $UncompressedSize
+            Artifacts = $Artifacts
+            Timestamp = [DateTimeOffset]::UtcNow.ToString("o")
+          }
+          $Report | ConvertTo-Json -Depth 4 | Set-Content $SizesFile -Encoding UTF8
+          Write-Host "Artifact sizes saved to $SizesFile"
+          Get-Content $SizesFile
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
@@ -563,6 +742,39 @@ jobs:
           Get-Content $ChecksumFile
           echo "::endgroup::"
 
+      - name: Generate consolidated size report
+        shell: pwsh
+        working-directory: output
+        run: |
+          $SizeFiles = Get-ChildItem -Path . -Recurse -File -Filter "sizes.*.json" | Sort-Object Name
+          if (-not $SizeFiles) {
+            Write-Host "No size files found."
+            return
+          }
+
+          $Rows = foreach ($file in $SizeFiles) {
+            $data = Get-Content $file.FullName -Raw | ConvertFrom-Json
+            $uncompressedMiB = [math]::Round($data.UncompressedSizeBytes / 1MB, 2)
+            foreach ($artifact in $data.Artifacts) {
+              [PSCustomObject]@{
+                Platform = $data.Platform
+                RID = $data.RuntimeIdentifier
+                Artifact = $artifact.Name
+                CompressedMiB = [math]::Round($artifact.SizeBytes / 1MB, 2)
+                UncompressedMiB = $uncompressedMiB
+              }
+            }
+          }
+
+          $SizeReportFile = Join-Path $PWD "sizes.md"
+          $Lines = @("# UniGetUI Release Artifact Sizes", "")
+          $Lines += $Rows | Format-Table -AutoSize | Out-String -Stream | Where-Object { $_.Trim() -ne '' }
+          Set-Content -Path $SizeReportFile -Value $Lines -Encoding utf8NoBOM
+
+          echo "::group::sizes"
+          Get-Content $SizeReportFile
+          echo "::endgroup::"
+
       - name: Create GitHub Release
         shell: pwsh
         env:
@@ -582,9 +794,10 @@ jobs:
           $Repository = $Env:GITHUB_REPOSITORY
           $DraftArg = if ($DraftRelease) { '--draft' } else { $null }
 
+          # De-duplicate by basename: release asset names must be unique (e.g. two sizes.md would 422).
           $Files = Get-ChildItem -Path . -Recurse -File | Where-Object {
             $_.Name -eq 'checksums.txt' -or $_.Name -notmatch '^checksums\..+\.txt$'
-          }
+          } | Group-Object Name | ForEach-Object { $_.Group[0] }
 
           if ($DryRun) {
             Write-Host "Dry Run: skipping GitHub release creation!"
@@ -600,7 +813,7 @@ jobs:
 
       - name: Check out Devolutions/actions
         if: ${{ fromJSON(needs.preflight.outputs.dry-run) == false }}
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: Devolutions/actions
           ref: v1
@@ -658,3 +871,54 @@ jobs:
           remote: releases
           source_path: Devolutions.UniGetUI.*
           working_directory: onedrive-staging
+
+  size-report:
+    name: Consolidated Size Report
+    runs-on: ubuntu-latest
+    needs: [preflight, build, build-avalonia]
+    if: always() && needs.build.result != 'cancelled' && needs.build-avalonia.result != 'cancelled'
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: output
+
+      - name: Generate consolidated size report
+        shell: pwsh
+        working-directory: output
+        run: |
+          $SizeFiles = Get-ChildItem -Path . -Recurse -File -Filter "sizes.*.json" | Sort-Object Name
+          if (-not $SizeFiles) {
+            Write-Host "No size files found."
+            return
+          }
+
+          $Rows = foreach ($file in $SizeFiles) {
+            $data = Get-Content $file.FullName -Raw | ConvertFrom-Json
+            $uncompressedMiB = [math]::Round($data.UncompressedSizeBytes / 1MB, 2)
+            foreach ($artifact in $data.Artifacts) {
+              [PSCustomObject]@{
+                Platform = $data.Platform
+                RID = $data.RuntimeIdentifier
+                Artifact = $artifact.Name
+                CompressedMiB = [math]::Round($artifact.SizeBytes / 1MB, 2)
+                UncompressedMiB = $uncompressedMiB
+              }
+            }
+          }
+
+          $SizeReportFile = Join-Path $PWD "sizes.md"
+          $Lines = @("# UniGetUI Release Artifact Sizes", "")
+          $Lines += $Rows | Format-Table -AutoSize | Out-String -Stream | Where-Object { $_.Trim() -ne '' }
+          Set-Content -Path $SizeReportFile -Value $Lines -Encoding utf8NoBOM
+
+          echo "::group::sizes"
+          Get-Content $SizeReportFile
+          echo "::endgroup::"
+
+      - name: Upload size report
+        uses: actions/upload-artifact@v7
+        with:
+          name: UniGetUI-size-report
+          path: output/sizes.md

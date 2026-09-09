@@ -28,7 +28,14 @@ namespace UniGetUI.PackageEngine.PackageClasses
         private readonly string _ignoredId;
         private readonly string _iconId;
 
-        private static readonly ConcurrentDictionary<int, Uri?> _cachedIconPaths = new();
+        private static readonly ConcurrentDictionary<long, Uri> _cachedIconPaths = new();
+        private static readonly ConcurrentDictionary<long, long> _failedIconLookups = new();
+        private static readonly TimeSpan _iconLookupRetryInterval = TimeSpan.FromMinutes(5);
+
+        public static TimeSpan? TEST_IconLookupRetryIntervalOverride { private get; set; }
+
+        private static TimeSpan IconLookupRetryInterval =>
+            TEST_IconLookupRetryIntervalOverride ?? _iconLookupRetryInterval;
 
         private IPackageDetails? __details;
         public IPackageDetails Details
@@ -65,6 +72,8 @@ namespace UniGetUI.PackageEngine.PackageClasses
         public string AutomationName { get; }
         public string Id { get; }
         public virtual string VersionString { get; }
+
+        public virtual bool HasConcreteVersion => true;
         public CoreTools.Version NormalizedVersion { get; }
         public CoreTools.Version NormalizedNewVersion { get; }
         public bool IsPopulated { get; set; }
@@ -162,12 +171,30 @@ namespace UniGetUI.PackageEngine.PackageClasses
 
         public virtual Uri? GetIconUrlIfAny()
         {
-            if (_cachedIconPaths.TryGetValue(this.GetHashCode(), out Uri? path))
+            long cacheKey = _versionedHash;
+            if (_cachedIconPaths.TryGetValue(cacheKey, out Uri? path))
             {
                 return path;
             }
+
+            if (
+                _failedIconLookups.TryGetValue(cacheKey, out long failedAt)
+                && Environment.TickCount64 - failedAt
+                    < (long)IconLookupRetryInterval.TotalMilliseconds
+            )
+            {
+                return null;
+            }
+
             var CachedIcon = LoadIconUrlIfAny();
-            _cachedIconPaths.TryAdd(this.GetHashCode(), CachedIcon);
+            if (CachedIcon is null)
+            {
+                _failedIconLookups[cacheKey] = Environment.TickCount64;
+                return null;
+            }
+
+            _failedIconLookups.TryRemove(cacheKey, out _);
+            _cachedIconPaths[cacheKey] = CachedIcon;
             return CachedIcon;
         }
 
@@ -179,11 +206,7 @@ namespace UniGetUI.PackageEngine.PackageClasses
                     Manager.DetailsHelper.GetIcon,
                     this
                 );
-                string? path = IconCacheEngine.GetCacheOrDownloadIcon(
-                    icon,
-                    Manager.Name,
-                    CoreTools.MakeValidFileName(Id)
-                );
+                string? path = IconCacheEngine.GetCacheOrDownloadIcon(icon, Manager.Name, Id);
                 return path is null ? null : new Uri((path.StartsWith('/') ? "file://" : "file:///") + path);
             }
             catch (Exception ex)
@@ -294,12 +317,12 @@ namespace UniGetUI.PackageEngine.PackageClasses
         {
             foreach (var p in GetInstalledPackages())
             {
-                if (p.NormalizedVersion == CoreTools.Version.Null || this.NormalizedNewVersion == CoreTools.Version.Null)
+                if (Manager.CompareVersions(p.VersionString, this.NewVersionString) is not { } comparison)
                 {
                     continue;
                 }
 
-                if (p.NormalizedVersion >= this.NormalizedNewVersion)
+                if (comparison >= 0)
                 {
                     return true;
                 }
@@ -308,11 +331,40 @@ namespace UniGetUI.PackageEngine.PackageClasses
             return false;
         }
 
+        private string ResolveInstallerVersion()
+        {
+            if (Manager.InstallerUrlFollowsPackageVersion)
+                return VersionString;
+
+            if (IsUpgradable)
+                return NewVersionString;
+
+            if (GetUpgradablePackage() is { } upgradable)
+                return upgradable.NewVersionString;
+
+            if (GetAvailablePackage() is { } available)
+                return available.VersionString;
+
+            return VersionString;
+        }
+
         public async Task<string?> GetInstallerFileName()
         {
+            var scheme = InstallerFileNaming.ResolveScheme();
+            string version = scheme is InstallerNameScheme.PublisherName
+                ? ""
+                : ResolveInstallerVersion();
+
             if (Manager.Name.StartsWith("PowerShell") || Manager.Name.StartsWith(".NET"))
             {
-                return CoreTools.MakeValidFileName($"{Id}.nupkg");
+                return InstallerFileNaming.Build(
+                    $"{Id}.nupkg",
+                    Name,
+                    Id,
+                    version,
+                    "nupkg",
+                    scheme
+                );
             }
             else
             {
@@ -320,21 +372,33 @@ namespace UniGetUI.PackageEngine.PackageClasses
                     await Details.Load();
                 if (Details.InstallerUrl is null)
                     return null;
-                return await CoreTools.GetFileNameAsync(Details.InstallerUrl);
+                return InstallerFileNaming.Build(
+                    await CoreTools.GetFileNameAsync(Details.InstallerUrl),
+                    Name,
+                    Id,
+                    version,
+                    Details.InstallerType,
+                    scheme
+                );
             }
         }
 
-        public virtual bool IsUpdateMinor()
+        // 1-based position of the most significant version component that changed
+        // (1=Major, 2=Minor, 3=Patch, 4=Remainder), or 0 if identical/unparseable.
+        private int HighestChangedVersionComponent()
+        {
+            if (NormalizedVersion == CoreTools.Version.Null || NormalizedNewVersion == CoreTools.Version.Null)
+                return 0;
+            return NormalizedVersion.FirstDifferingComponent(NormalizedNewVersion);
+        }
+
+        public virtual bool IsUpdateMinor(int level = InstallOptions.DefaultSkipMinorLevel)
         {
             if (!IsUpgradable)
                 return false;
 
-            return NormalizedVersion.Major == NormalizedNewVersion.Major
-                && NormalizedVersion.Minor == NormalizedNewVersion.Minor
-                && (
-                    NormalizedVersion.Patch != NormalizedNewVersion.Patch
-                    || NormalizedVersion.Remainder != NormalizedNewVersion.Remainder
-                );
+            int changed = HighestChangedVersionComponent();
+            return changed >= level;
         }
 
         public virtual Task<InstallOptions> GetInstallOptions() =>
@@ -372,6 +436,7 @@ namespace UniGetUI.PackageEngine.PackageClasses
         public static void ResetIconCache()
         {
             _cachedIconPaths.Clear();
+            _failedIconLookups.Clear();
         }
 
         private static string GenerateIconId(Package p)

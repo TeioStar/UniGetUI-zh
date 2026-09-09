@@ -1,76 +1,157 @@
-using Octokit;
 using UniGetUI.Core.Data;
 using UniGetUI.Core.Logging;
 using UniGetUI.Core.SecureSettings;
 using UniGetUI.Core.Tools;
+using UniGetUI.Interface;
 using CoreSettings = UniGetUI.Core.SettingsEngine.Settings;
 
 namespace UniGetUI.Avalonia.Infrastructure;
 
 internal sealed class GitHubAuthService
 {
+    private const string MissingClientId = "CLIENT_ID_UNSET";
+    private const string MissingClientSecret = "CLIENT_SECRET_UNSET";
+    private static readonly TimeSpan LoginTimeout = TimeSpan.FromMinutes(2);
     private readonly string _gitHubClientId = Secrets.GetGitHubClientId();
-    private readonly GitHubClient _client;
+    private readonly string _gitHubClientSecret = Secrets.GetGitHubClientSecret();
+    private const string RedirectUri = "http://127.0.0.1:58642/";
 
     public static event EventHandler<EventArgs>? AuthStatusChanged;
 
-    /// <summary>
-    /// Fired when the device flow has started. Provides the user code and verification URI
-    /// that must be shown to the user so they can authorize the app at GitHub.
-    /// </summary>
-    public static event EventHandler<(string UserCode, string VerificationUri)>? DeviceFlowStarted;
+    public GitHubAuthService() { }
 
-    public GitHubAuthService()
-    {
-        _client = new GitHubClient(new ProductHeaderValue("UniGetUI", CoreData.VersionName));
-    }
-
-    public static GitHubClient? CreateGitHubClient()
+    public static GitHubApiClient? CreateGitHubClient()
     {
         var token = SecureGHTokenManager.GetToken();
         if (string.IsNullOrEmpty(token))
             return null;
 
-        return new GitHubClient(new ProductHeaderValue("UniGetUI", CoreData.VersionName))
-        {
-            Credentials = new Credentials(token),
-        };
+        return new GitHubApiClient(token);
     }
+
+    private GHAuthApiRunner? _loginBackend;
+    private string? _codeFromApi;
+    private bool _loginWasCancelled;
 
     public async Task<bool> SignInAsync()
     {
         try
         {
-            Logger.Info("Initiating GitHub sign-in using device flow...");
-
-            var deviceFlow = await _client.Oauth.InitiateDeviceFlow(
-                new OauthDeviceFlowRequest(_gitHubClientId)
-                {
-                    Scopes = { "read:user", "gist" },
-                }, CancellationToken.None);
-
-            // Open the verification page and notify the UI layer so it can show the user code.
-            CoreTools.Launch(deviceFlow.VerificationUri);
-            DeviceFlowStarted?.Invoke(this, (deviceFlow.UserCode, deviceFlow.VerificationUri));
-
-            // Octokit handles polling with the correct interval until the user authorises or the code expires.
-            var token = await _client.Oauth.CreateAccessTokenForDeviceFlow(_gitHubClientId, deviceFlow, CancellationToken.None);
-
-            if (string.IsNullOrEmpty(token.AccessToken))
+            if (!HasConfiguredOAuthClient())
             {
-                Logger.Error("Failed to obtain GitHub access token via device flow.");
+                Logger.Error("GitHub sign-in is not configured for this build. Missing OAuth client ID or client secret.");
                 AuthStatusChanged?.Invoke(this, EventArgs.Empty);
                 return false;
             }
 
-            Logger.Info("GitHub device flow login successful. Storing access token.");
+            Logger.Info("Initiating GitHub sign-in process using loopback redirect...");
+
+            var oauthLoginUrl = GitHubApiClient.GetOAuthLoginUrl(
+                _gitHubClientId,
+                new Uri(RedirectUri),
+                ["read:user", "gist"]
+            );
+
+            _codeFromApi = null;
+            _loginWasCancelled = false;
+            await StopLoginBackend();
+            _loginBackend = new GHAuthApiRunner();
+            _loginBackend.OnLogin += BackgroundApiOnOnLogin;
+            _loginBackend.OnCancelled += BackgroundApiOnCancelled;
+            await _loginBackend.Start();
+
+            CoreTools.Launch(oauthLoginUrl.ToString());
+
+            DateTime timeoutAt = DateTime.UtcNow.Add(LoginTimeout);
+            while (_codeFromApi is null && !_loginWasCancelled && DateTime.UtcNow < timeoutAt)
+                await Task.Delay(100);
+
+            if (_loginWasCancelled)
+            {
+                Logger.Warn("GitHub sign-in was cancelled by the user.");
+                AuthStatusChanged?.Invoke(this, EventArgs.Empty);
+                return false;
+            }
+
+            if (string.IsNullOrEmpty(_codeFromApi))
+            {
+                Logger.Error("GitHub sign-in timed out before the loopback callback was received.");
+                AuthStatusChanged?.Invoke(this, EventArgs.Empty);
+                return false;
+            }
+
+            return await CompleteSignInAsync(_codeFromApi);
+        }
+        catch (Exception ex)
+        {
+            Logger.Error("Exception during GitHub sign-in process:");
+            Logger.Error(ex);
+            ClearAuthenticatedUserData();
+            AuthStatusChanged?.Invoke(this, EventArgs.Empty);
+            return false;
+        }
+        finally
+        {
+            await StopLoginBackend();
+        }
+    }
+
+    private void BackgroundApiOnOnLogin(object? sender, string code)
+    {
+        _codeFromApi = code;
+    }
+
+    private void BackgroundApiOnCancelled(object? sender, string error)
+    {
+        _loginWasCancelled = true;
+    }
+
+    private async Task StopLoginBackend()
+    {
+        if (_loginBackend is null) return;
+        try
+        {
+            _loginBackend.OnLogin -= BackgroundApiOnOnLogin;
+            _loginBackend.OnCancelled -= BackgroundApiOnCancelled;
+            await _loginBackend.Stop();
+            _loginBackend.Dispose();
+        }
+        catch (Exception ex) { Logger.Warn(ex); }
+        finally { _loginBackend = null; }
+    }
+
+    private bool HasConfiguredOAuthClient()
+    {
+        return !string.IsNullOrWhiteSpace(_gitHubClientId)
+            && !string.IsNullOrWhiteSpace(_gitHubClientSecret)
+            && !string.Equals(_gitHubClientId, MissingClientId, StringComparison.Ordinal)
+            && !string.Equals(_gitHubClientSecret, MissingClientSecret, StringComparison.Ordinal);
+    }
+
+    private async Task<bool> CompleteSignInAsync(string code)
+    {
+        try
+        {
+            using var client = new GitHubApiClient();
+            var token = await client.CreateAccessTokenAsync(
+                _gitHubClientId,
+                _gitHubClientSecret,
+                code,
+                new Uri(RedirectUri)
+            );
+
+            if (string.IsNullOrEmpty(token.AccessToken))
+            {
+                Logger.Error("Failed to obtain GitHub access token.");
+                AuthStatusChanged?.Invoke(this, EventArgs.Empty);
+                return false;
+            }
+
+            Logger.Info("GitHub login successful. Storing access token.");
             SecureGHTokenManager.StoreToken(token.AccessToken);
 
-            var userClient = new GitHubClient(new ProductHeaderValue("UniGetUI"))
-            {
-                Credentials = new Credentials(token.AccessToken),
-            };
-            var user = await userClient.User.Current();
+            using var userClient = new GitHubApiClient(token.AccessToken);
+            var user = await userClient.GetCurrentUserAsync();
             if (user is not null)
             {
                 CoreSettings.SetValue(CoreSettings.K.GitHubUserLogin, user.Login);
@@ -82,7 +163,7 @@ internal sealed class GitHubAuthService
         }
         catch (Exception ex)
         {
-            Logger.Error("Exception during GitHub device flow sign-in:");
+            Logger.Error("Exception during GitHub token exchange:");
             Logger.Error(ex);
             ClearAuthenticatedUserData();
             AuthStatusChanged?.Invoke(this, EventArgs.Empty);

@@ -6,6 +6,11 @@
 #define MyAppPublisher "Devolutions Inc."
 #define MyAppURL "https://github.com/Devolutions/UniGetUI"
 #define MyAppExeName "UniGetUI.exe"
+#define MyAppPublisherURL "https://devolutions.net/unigetui/"
+#define MyAppCopyright "Copyright 2021-2026 " + MyAppPublisher
+#ifndef InstallerCompression
+#define InstallerCompression "lzma"
+#endif
 
 #define public Dependency_Path_NetCoreCheck "InstallerExtras\"
 #include "InstallerExtras\CodeDependencies.iss"
@@ -14,22 +19,31 @@
 [Setup]
 ; NOTE: The value of AppId uniquely identifies this application. Do not use the same AppId value in installers for other applications.
 ; (To generate a new GUID, click Tools | Generate GUID inside the IDE.)
-UninstallDisplayName="UniGetUI"
+UninstallDisplayName={#MyAppName}
 AppId={{889610CC-4337-4BDB-AC3B-4F21806C0BDE}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppVerName={#MyAppName} {#MyAppVersion}
 AppPublisher={#MyAppPublisher}
-AppPublisherURL="https://devolutions.net/unigetui/"
+AppPublisherURL={#MyAppPublisherURL}
 AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}
+; VersionInfoVersion / *ProductVersion are stamped by scripts/set-version.ps1 — keep them literal.
 VersionInfoVersion=3.3.7.0
 VersionInfoProductVersion=3.3.7.0
+VersionInfoProductName={#MyAppName}
+VersionInfoDescription={#MyAppName} Installer
+VersionInfoCompany={#MyAppPublisher}
+VersionInfoCopyright={#MyAppCopyright}
+AppCopyright={#MyAppCopyright}
 DefaultDirName="{autopf64}\UniGetUI"
 DisableProgramGroupPage=yes
 DisableDirPage=no
 DirExistsWarning=no
-CloseApplications=no
+; Force-close any process holding files we overwrite (backstop for the kill in PrepareToInstall).
+CloseApplications=force
+CloseApplicationsFilter=*.exe,*.dll
+RestartApplications=no
 ; Default to per-user install mode and let the dialog opt into all-users installs when needed.
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
@@ -41,9 +55,9 @@ SignTool=azsign
 SignedUninstaller=yes
 SignedUninstallerDir=InstallerExtras\
 MinVersion=10.0
-SetupIconFile=src\UniGetUI\Assets\Images\icon.ico
+SetupIconFile=src\SharedAssets\Assets\Images\icon.ico
 UninstallDisplayIcon={app}\UniGetUI.exe
-Compression=lzma
+Compression={#InstallerCompression}
 SolidCompression=yes
 WizardStyle=modern dynamic
 WizardImageFile=InstallerExtras\installer-banner.png
@@ -61,55 +75,109 @@ Uninstallable=WizardIsTaskSelected('regularinstall')
 AppModifyPath="{app}\UniGetUI.Installer.exe" /silent /NoDeployInstaller
 
 
-[Languages]
-Name: "English"; MessagesFile: "compiler:Default.isl"
-Name: "Armenian"; MessagesFile: "compiler:Languages\Armenian.isl"
-Name: "BrazilianPortuguese"; MessagesFile: "compiler:Languages\BrazilianPortuguese.isl"
-Name: "Catalan"; MessagesFile: "compiler:Languages\Catalan.isl"
-Name: "Corsican"; MessagesFile: "compiler:Languages\Corsican.isl"
-Name: "Czech"; MessagesFile: "compiler:Languages\Czech.isl"
-Name: "Danish"; MessagesFile: "compiler:Languages\Danish.isl"
-Name: "Dutch"; MessagesFile: "compiler:Languages\Dutch.isl"
-Name: "Finnish"; MessagesFile: "compiler:Languages\Finnish.isl"
-Name: "French"; MessagesFile: "compiler:Languages\French.isl"
-Name: "German"; MessagesFile: "compiler:Languages\German.isl"
-Name: "Hebrew"; MessagesFile: "compiler:Languages\Hebrew.isl"
-;Name: "Icelandic"; MessagesFile: "compiler:Languages\Icelandic.isl"
-Name: "Italian"; MessagesFile: "compiler:Languages\Italian.isl"
-Name: "Japanese"; MessagesFile: "compiler:Languages\Japanese.isl"
-Name: "Korean"; MessagesFile: "compiler:Languages\Korean.isl"
-Name: "Norwegian"; MessagesFile: "compiler:Languages\Norwegian.isl"
-Name: "Polish"; MessagesFile: "compiler:Languages\Polish.isl"
-Name: "Portuguese"; MessagesFile: "compiler:Languages\Portuguese.isl"
-Name: "Russian"; MessagesFile: "compiler:Languages\Russian.isl"
-Name: "Slovenian"; MessagesFile: "compiler:Languages\Slovenian.isl"
-Name: "Spanish"; MessagesFile: "compiler:Languages\Spanish.isl"
-Name: "Turkish"; MessagesFile: "compiler:Languages\Turkish.isl"
-Name: "Ukrainian"; MessagesFile: "compiler:Languages\Ukrainian.isl" 
-
-; Include installer's messages
+; Include installer's languages and messages
+#include "InstallerExtras\Languages.iss"
 #include "InstallerExtras\CustomMessages.iss"
 
 [Code]
+var
+  PreserveAutostartDisabled: Boolean;
+  // Set once the marker is written (which happens only after {app} is initialized).
+  MarkerWritten: Boolean;
+
+// StartupApproved stores the on/off state in the first byte's low bit (03 = off).
+function IsAutostartDisabledByUser: Boolean;
+var
+  Data: AnsiString;
+begin
+  Result := False;
+  if RegQueryBinaryValue(HKEY_CURRENT_USER,
+       'Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run',
+       'WingetUI', Data) then
+    Result := (Length(Data) >= 1) and ((Ord(Data[1]) and 1) = 1);
+end;
+
 procedure InitializeWizard;
 begin
   WizardForm.Bevel.Visible := False;
   WizardForm.Bevel1.Visible := True;
+  // DisableWelcomePage=no makes Inno caption use AppName alone; put the version back in.
+  WizardForm.Caption := FmtMessage(SetupMessage(msgSetupWindowTitle), ['{#MyAppName} {#MyAppVersion}']);
 end;
 
-procedure TaskKill(FileName: String);
+// Kills all instances of an image and loops until none remain (taskkill returns 0 while killing, 128 when none left).
+procedure TaskKillWait(FileName: String);
 var
-  ResultCode: Integer;
+  ResultCode, Attempts: Integer;
 begin
-    Exec('taskkill.exe', '/f /im ' + '"' + FileName + '"', '', SW_HIDE,
-     ewWaitUntilTerminated, ResultCode);
+    Attempts := 0;
+    repeat
+        if not Exec('taskkill.exe', '/f /im "' + FileName + '"', '', SW_HIDE,
+            ewWaitUntilTerminated, ResultCode) then
+            Break;
+        if ResultCode <> 0 then
+            Break;
+        Sleep(500);
+        Attempts := Attempts + 1;
+    until Attempts >= 10;
 end;
 
 procedure KillRunningApps;
 begin
-    TaskKill('WingetUI.exe');
-    TaskKill('UniGetUI.exe');
-    TaskKill('UniGetUI.Avalonia.exe');
+    TaskKillWait('WingetUI.exe');
+    TaskKillWait('UniGetUI.exe');
+    TaskKillWait('UniGetUI.Avalonia.exe');
+    // Elevator (gsudo cache) and pinget live in {app} and lock their own files.
+    TaskKillWait('UniGetUI Elevator.exe');
+    TaskKillWait('pinget.exe');
+    Sleep(1000); // let the OS release file handles before copying
+
+end;
+
+function GetCurrentProcessId: Cardinal; external 'GetCurrentProcessId@kernel32.dll stdcall';
+
+function UpdateMarkerPath(): String;
+begin
+    Result := ExpandConstant('{app}\.unigetui-update-in-progress');
+end;
+
+// Marker holds our PID; the app blocks only while this installer runs. Name MUST match UpdateInProgressGuard.MarkerFileName.
+procedure WriteUpdateMarker;
+var
+    Pid: Int64;
+begin
+    ForceDirectories(ExpandConstant('{app}'));
+    Pid := GetCurrentProcessId;
+    // Track reality: only guard removal if the marker was actually written.
+    MarkerWritten := SaveStringToFile(UpdateMarkerPath(), IntToStr(Pid), False);
+end;
+
+procedure RemoveUpdateMarker;
+begin
+    // Guard against DeinitializeSetup expanding {app} on an abort before the
+    // directory page is confirmed — {app} isn't initialized yet and would throw.
+    if not MarkerWritten then
+        Exit;
+    // Keep the flag set if deletion fails, so DeinitializeSetup retries it.
+    if DeleteFile(UpdateMarkerPath()) then
+        MarkerWritten := False;
+end;
+
+// Runs before any file is copied: shut everything down, then mark the copy window.
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+    // Capture before [Registry] rewrites the Run key, so updates keep the user's choice.
+    PreserveAutostartDisabled := IsAutostartDisabledByUser;
+    KillRunningApps;
+    WriteUpdateMarker;
+    Result := '';
+end;
+
+// Clear the marker once the copy is done, before the post-install launch.
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+    if CurStep = ssPostInstall then
+        RemoveUpdateMarker;
 end;
 
 function CmdLineParamExists(const Value: string): Boolean;
@@ -125,6 +193,31 @@ begin
     end;
 end;
 
+function IsMSStoreInstall: Boolean;
+begin
+  Result := CmdLineParamExists('/MSStore');
+end;
+
+function ShouldInstallVCRedist: Boolean;
+begin
+  Result := not (CmdLineParamExists('/NoVCRedist') or IsMSStoreInstall);
+end;
+
+function ShouldInstallEdgeWebView: Boolean;
+begin
+  Result := not (CmdLineParamExists('/NoEdgeWebView') or IsMSStoreInstall);
+end;
+
+function ShouldLaunchAfterInstall: Boolean;
+begin
+  Result := not (CmdLineParamExists('/NoAutoStart') or IsMSStoreInstall);
+end;
+
+function ShouldSuppressRunOnStartup: Boolean;
+begin
+  Result := CmdLineParamExists('/NoRunOnStartup') or IsMSStoreInstall or PreserveAutostartDisabled;
+end;
+
 var CustomExitCode: integer;
 
 procedure ExitProcess(exitCode:integer);
@@ -132,6 +225,8 @@ procedure ExitProcess(exitCode:integer);
 
 procedure DeinitializeSetup();
 begin
+    RemoveUpdateMarker; // also clear on abort, before ssPostInstall
+
     if (CustomExitCode <> 0) then
     begin
         DelTree(ExpandConstant('{tmp}'), True, True, True);
@@ -163,20 +258,18 @@ begin
     not IsDirNameValid(WizardForm.DirEdit.Text) then
   begin
     Result := False;
-    MsgBox('There is an invalid character in the selected install location. ' +
-      'Install location cannot contain special characters. ' +
-      'Please input a valid path to continue, such as '+ExpandConstant('{commonpf64}')+'\UniGetUI', mbError, MB_OK);
+    MsgBox(FmtMessage(CustomMessage('InvalidInstallPath'), [ExpandConstant('{commonpf64}') + '\UniGetUI']), mbError, MB_OK);
   end;
 end;
 
 function InitializeSetup: Boolean;
 begin
   try
-    if not CmdLineParamExists('/NoVCRedist') then
+    if ShouldInstallVCRedist then
     begin
       Dependency_AddVC2015To2022;
     end;
-    if not CmdLineParamExists('/NoEdgeWebView') then
+    if ShouldInstallEdgeWebView then
     begin
       Dependency_AddWebView2;
     end;
@@ -195,7 +288,7 @@ Name: "regularinstall\desktopicon"; Description: "{cm:RegDesktopIcon}"; GroupDes
 
 [Registry]
 Root: HKCU; Subkey: "SOFTWARE\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "WingetUI"; ValueData: """{app}\UniGetUI.exe"" --daemon"; Flags: uninsdeletevalue noerror; Tasks: regularinstall;
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"; ValueType: binary; ValueName: "WingetUI"; ValueData: "03"; Flags: uninsdeletevalue; Tasks: regularinstall; Check: CmdLineParamExists('/NoRunOnStartup');
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"; ValueType: binary; ValueName: "WingetUI"; ValueData: "03"; Flags: uninsdeletevalue; Tasks: regularinstall; Check: ShouldSuppressRunOnStartup;
 
 // Register the unigetui:// deep link
 Root: HKA; Subkey: "Software\Classes\unigetui"; ValueType: "string"; ValueData: "URL:UniGetUI Protocol"; Flags: uninsdeletekey; Tasks: regularinstall;
@@ -210,26 +303,41 @@ Root: HKA; Subkey: "Software\Classes\UniGetUI.PackageBundle\DefaultIcon"; ValueT
 Root: HKA; Subkey: "Software\Classes\UniGetUI.PackageBundle\shell\open\command"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"" ""%1"""; Flags: uninsdeletekey; Tasks: regularinstall;
 
 
+; This section deletes ONLY files the current build never ships (leftovers from the old
+; WinUI install). The live set — Assets\, *.dll, *.pdb, *.json (incl. runtimeconfig.json) —
+; is deliberately NOT listed: [Files] overwrites those in place (ignoreversion, atomic
+; temp-then-rename), so a cancelled/interrupted update can't leave the running app missing
+; files (which the crash handler would report as "Missing Files"). Deleting the live set up
+; front, as this used to, guaranteed a broken install if the copy was cut short.
+; WARNING: only add patterns here that the current build does NOT produce — matches are
+; deleted before the copy, so a live match would blank the install on an interrupted update.
+[InstallDelete]
+Type: filesandordirs; Name: "{app}\Avalonia"
+Type: files; Name: "{app}\WingetUI.exe"
+Type: files; Name: "{app}\UniGetUI.Avalonia.exe"
+Type: files; Name: "{app}\*.pri"
+Type: files; Name: "{app}\*.xbf"
+
 [Files]
 ; Deploy installer for autorepair jobs (unless disabled)
 Source: "{srcexe}"; DestDir: "{app}"; DestName: "UniGetUI.Installer.exe"; Flags: external ignoreversion; Tasks: regularinstall; Check: not CmdLineParamExists('/NoDeployInstaller');
 ; Deploy integrity tree
 Source: "unigetui_bin\IntegrityTree.json"; DestDir: "{app}"; Flags: createallsubdirs ignoreversion recursesubdirs;
-; Deploy executable files
-Source: "unigetui_bin\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion; BeforeInstall: KillRunningApps;
+; Deploy executable files (running instances already killed in PrepareToInstall).
+Source: "unigetui_bin\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion;
 Source: "unigetui_bin\*"; DestDir: "{app}"; Flags: createallsubdirs ignoreversion recursesubdirs;
 ; Make installation portable (if required)
 Source: "InstallerExtras\ForceUniGetUIPortable"; DestDir: "{app}"; Tasks: portableinstall
 
 
 [Icons]
-Name: "{autostartmenu}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: regularinstall\startmenuicon
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: regularinstall\desktopicon
+Name: "{autostartmenu}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; AppUserModelID: "Devolutions.UniGetUI"; Tasks: regularinstall\startmenuicon
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: regularinstall\desktopicon; Check: not CmdLineParamExists('/NoDesktopShortcut')
 
 [Run]
 ; Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -File -NonInteractive ""{tmp}\EnsureWinGet.ps1"""; StatusMsg: "Ensuring WinGet is properly installed... (this may take a while)"; WorkingDir: {app}; Check: not CmdLineParamExists('/NoWinGet'); Flags: runhidden
-Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: runasoriginaluser nowait postinstall; Check: not CmdLineParamExists('/NoAutoStart');
-Filename: "{app}\{#MyAppExeName}"; Parameters: "--migrate-wingetui-to-unigetui"; StatusMsg: "Removing old icons...";
+Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: runasoriginaluser nowait postinstall; Check: ShouldLaunchAfterInstall;
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--migrate-wingetui-to-unigetui"; StatusMsg: "{cm:RemovingOldIcons}";
 
 
 [UninstallRun]    
